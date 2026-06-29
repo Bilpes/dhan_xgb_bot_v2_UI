@@ -1,0 +1,14 @@
+# UI Dashboard API dependencies
+# Install with: pip install -r ui/api/requirements.txt
+
+flask>=3.0.0
+flask-cors>=4.0.0
+python-dotenv>=1.0.0
+
+# Already required by the bot (should already be installed):
+# xgboost
+# pandas
+# numpy
+# scikit-learn
+# dhanhq
+# requests
