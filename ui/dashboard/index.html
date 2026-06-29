@@ -55,6 +55,9 @@
     padding: 5px 12px; border-radius: var(--radius); cursor: pointer; font-size: 12px;
     transition: all .2s; }
   .btn-refresh:hover { border-color: var(--accent); color: var(--accent); }
+  .api-indicator { font-size: 10px; padding: 2px 8px; border-radius: 20px; }
+  .api-live { background: rgba(0,230,118,.1); color: var(--green); border: 1px solid rgba(0,230,118,.25); }
+  .api-mock { background: rgba(255,215,64,.1); color: var(--yellow); border: 1px solid rgba(255,215,64,.25); }
 
   /* ── LAYOUT ── */
   .main { display: grid; grid-template-columns: 320px 1fr; gap: 0; height: calc(100vh - 51px); overflow: hidden; }
@@ -286,6 +289,7 @@
     </div>
   </div>
   <div class="header-right">
+    <div class="api-indicator api-mock" id="apiIndicator">● MOCK</div>
     <div class="clock" id="clock">09:30:00 IST</div>
     <div class="market-pill market-open" id="marketStatus">⬤ MARKET OPEN</div>
     <button class="btn-refresh" onclick="refreshAll()">↺ Refresh</button>
@@ -336,25 +340,25 @@
       <div class="card-title">Nifty 50 Regime</div>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
         <div style="flex:1">
-          <div style="font-size:20px;font-weight:800" id="niftyLtp">24,812.40</div>
+          <div style="font-size:20px;font-weight:800" id="niftyLtp">—</div>
           <div style="font-size:11px;color:var(--text3);margin-top:2px">Last refreshed: <span id="niftyRefreshed">—</span></div>
         </div>
         <div>
-          <div class="regime-pill regime-bull" id="regimePill">BULLISH</div>
-          <div style="font-size:9px;color:var(--text3);margin-top:4px;text-align:center" id="regimeRsi">RSI 58.2</div>
+          <div class="regime-pill regime-neutral" id="regimePill">—</div>
+          <div style="font-size:9px;color:var(--text3);margin-top:4px;text-align:center" id="regimeRsi">RSI —</div>
         </div>
       </div>
       <div style="display:flex;gap:14px">
         <div class="nifty-stat">
-          <div class="nifty-stat-v" id="niftyChg">+0.42%</div>
+          <div class="nifty-stat-v" id="niftyChg">—</div>
           <div class="nifty-stat-l">Change</div>
         </div>
         <div class="nifty-stat">
-          <div class="nifty-stat-v" id="niftyAtr">0.85%</div>
+          <div class="nifty-stat-v" id="niftyAtr">—</div>
           <div class="nifty-stat-l">ATR%</div>
         </div>
         <div class="nifty-stat">
-          <div class="nifty-stat-v" id="niftyEma">Above EMA20</div>
+          <div class="nifty-stat-v" id="niftyEma">—</div>
           <div class="nifty-stat-l">EMA20</div>
         </div>
       </div>
@@ -515,7 +519,7 @@
       <!-- Charges Tab -->
       <div id="tab-charges" style="display:none">
         <div class="card">
-          <div class="card-title">Brokerage & Charge Breakdown (Today)</div>
+          <div class="card-title">Brokerage &amp; Charge Breakdown (Today)</div>
           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px" id="chargeCards"></div>
           <div style="margin-top:16px">
             <div class="card-title">Dhan Intraday Charge Formula</div>
@@ -531,23 +535,24 @@
 <script>
 // ═══════════════════════════════════════════════════════════
 //  XGB Bot Dashboard — Pure JS, no framework
-//  Data source: reads from bot's CSV/JSON logs when served
-//  via Flask API. Falls back to realistic mock data for preview.
+//  FIX-14: fetchBotState() now calls /api/state as primary.
+//          MOCK data is only used if the API call fails
+//          (e.g. Flask is not running / offline preview).
 // ═══════════════════════════════════════════════════════════
 
-// ── CONFIG (mirrors config/config.py + config/watchlist.json) ─
+// ── CONFIG ─────────────────────────────────────────────────
 const CONFIG = {
   capital:        400000,
   maxOpenTrades:  5,
   maxRiskPct:     0.01,
   maxCapPerTrade: 0.25,
-  maxDailyLoss:   6000,    // ~1.5% of capital
+  maxDailyLoss:   6000,
   trailAfterPct:  0.015,
   trailDistance:  0.012,
   marketOpen:     '09:15',
   marketClose:    '15:30',
   noNewAfter:     '15:00',
-  scanInterval:   30000,   // ms
+  scanInterval:   30000,
   monitorInterval:60000,
   candleMinutes:  5,
 };
@@ -577,62 +582,12 @@ const TIER_MAP = {
   ETERNAL:'B', ADANIPORTS:'B', CGPOWER:'B', HAVELLS:'B'
 };
 
-// ── MOCK DATA (replace with /api/... calls when Flask is running) ─
+// ── MOCK (offline fallback only — not used when Flask is running) ─
 const MOCK = {
-  mode: 'paper',
-  halted: false,
-  nifty: { ltp: 24812.40, chg: 0.42, atr: 0.85, rsi: 58.2, ema20: 'above', regime: 'bull' },
-  openTrades: [
-    { symbol:'ICICIBANK', secId:'4963', side:'LONG', qty:38, entry:1302.50, ltp:1318.75,
-      sl:1270.00, target:1355.00, trailSl:1295.00, trailCount:2,
-      prob:0.782, rr:2.15, atr:12.4, openTime:'10:32', candles:14, sector:'BANKING', regime:'high_conf' },
-    { symbol:'BAJFINANCE', secId:'317', side:'LONG', qty:12, entry:7124.00, ltp:7089.50,
-      sl:6950.00, target:7380.00, trailSl:6950.00, trailCount:0,
-      prob:0.671, rr:1.88, atr:68.2, openTime:'11:05', candles:8, sector:'FINANCE', regime:'medium_conf' },
-  ],
-  closedTrades: [
-    { ts:'09:52', symbol:'SBIN', side:'LONG', qty:55, entry:830.20, exit:856.40,
-      hold:38, reason:'TARGET_HIT', gross:1441, charges:312, net:1129,
-      prob:0.745, rr:2.10, regime:'high_conf', sector:'BANKING' },
-    { ts:'10:18', symbol:'LT', side:'LONG', qty:22, entry:3580.00, exit:3542.00,
-      hold:22, reason:'SL_HIT', gross:-836, charges:198, net:-1034,
-      prob:0.668, rr:1.95, regime:'medium_conf', sector:'INFRA' },
-    { ts:'13:45', symbol:'SUNPHARMA', side:'LONG', qty:28, entry:1685.00, exit:1724.50,
-      hold:67, reason:'SIGNAL_FLIP', gross:1106, charges:245, net:861,
-      prob:0.712, rr:2.05, regime:'medium_conf', sector:'PHARMA' },
-  ],
-  watchlist: [
-    {s:'ICICIBANK', ltp:1318.75, chg:+1.24, sig:'OPEN',  conf:0.782, sl:1270, tp:1355, rr:2.15},
-    {s:'SBIN',      ltp:858.30,  chg:+0.92, sig:'BUY',   conf:0.718, sl:835,  tp:895,  rr:1.98},
-    {s:'AXISBANK',  ltp:1142.00, chg:-0.31, sig:'HOLD',  conf:0.541, sl:1110, tp:1185, rr:1.90},
-    {s:'KOTAKBANK', ltp:1892.50, chg:+0.18, sig:'HOLD',  conf:0.558, sl:1850, tp:1960, rr:1.62},
-    {s:'BAJFINANCE',ltp:7089.50, chg:-0.48, sig:'OPEN',  conf:0.671, sl:6950, tp:7380, rr:1.88},
-    {s:'HDFCBANK',  ltp:1782.40, chg:+0.55, sig:'BUY',   conf:0.694, sl:1740, tp:1850, rr:1.62},
-    {s:'RELIANCE',  ltp:2912.00, chg:+0.21, sig:'HOLD',  conf:0.602, sl:2850, tp:3010, rr:1.58},
-    {s:'LT',        ltp:3542.00, chg:-0.22, sig:'SELL',  conf:0.621, sl:3600, tp:3420, rr:1.74},
-    {s:'SUNPHARMA', ltp:1724.50, chg:+0.88, sig:'HOLD',  conf:0.634, sl:1680, tp:1790, rr:1.53},
-    {s:'DRREDDY',   ltp:6142.00, chg:+1.12, sig:'BUY',   conf:0.703, sl:5980, tp:6380, rr:1.49},
-    {s:'CIPLA',     ltp:1562.80, chg:-0.14, sig:'HOLD',  conf:0.512, sl:1520, tp:1620, rr:1.61},
-    {s:'HAL',       ltp:4782.00, chg:+1.45, sig:'BUY',   conf:0.741, sl:4620, tp:5010, rr:1.42},
-    {s:'BEL',       ltp:312.40,  chg:+0.72, sig:'HOLD',  conf:0.578, sl:302,  tp:328,  rr:1.57},
-    {s:'TITAN',     ltp:3224.00, chg:-0.08, sig:'HOLD',  conf:0.534, sl:3140, tp:3360, rr:1.62},
-    {s:'TRENT',     ltp:5812.00, chg:+0.94, sig:'BUY',   conf:0.688, sl:5640, tp:6080, rr:1.43},
-    {s:'ETERNAL',   ltp:242.80,  chg:+0.42, sig:'HOLD',  conf:0.560, sl:234,  tp:255,  rr:1.38},
-    {s:'ADANIPORTS',ltp:1312.50, chg:+0.38, sig:'HOLD',  conf:0.548, sl:1270, tp:1380, rr:1.71},
-    {s:'EICHERMOT', ltp:4842.00, chg:-0.52, sig:'SELL',  conf:0.598, sl:4900, tp:4700, rr:1.67},
-    {s:'CHOLAFIN',  ltp:1382.00, chg:+0.81, sig:'HOLD',  conf:0.564, sl:1340, tp:1440, rr:1.47},
-    {s:'CGPOWER',   ltp:612.40,  chg:+1.18, sig:'BUY',   conf:0.712, sl:590,  tp:648,  rr:1.64},
-    {s:'HAVELLS',   ltp:1782.00, chg:-0.19, sig:'HOLD',  conf:0.524, sl:1730, tp:1860, rr:1.56},
-  ],
-  alerts: [
-    {icon:'🟢', text:'<span class="alert-sym">SBIN</span> TARGET HIT → exit ₹856.40 · Net P&L: +₹1,129', time:'13:45'},
-    {icon:'🔴', text:'<span class="alert-sym">LT</span> SL HIT → exit ₹3,542 · Net P&L: -₹1,034', time:'10:18'},
-    {icon:'🔵', text:'<span class="alert-sym">BAJFINANCE</span> ENTRY ₹7,124 · qty=12 · SL=₹6,950 · TP=₹7,380', time:'11:05'},
-    {icon:'🟡', text:'<span class="alert-sym">ICICIBANK</span> Trail SL updated ₹1,285 → ₹1,295 (trail#2)', time:'11:52'},
-    {icon:'🔵', text:'<span class="alert-sym">ICICIBANK</span> ENTRY ₹1,302.50 · qty=38 · SL=₹1,270 · TP=₹1,355', time:'10:32'},
-    {icon:'🟢', text:'<span class="alert-sym">SUNPHARMA</span> SIGNAL_FLIP exit ₹1,724.50 · Net: +₹861', time:'13:45'},
-    {icon:'ℹ️', text:'Nifty regime: <b>BULLISH</b> · RSI 58.2 · ATR% 0.85', time:'09:30'},
-    {icon:'🤖', text:'Bot started · PAPER mode · Capital ₹4,00,000', time:'09:14'},
+  mode: 'paper', halted: false,
+  nifty: { ltp: 0, chg: 0, atr: 0, rsi: 50, ema20: 'above', regime: 'neutral' },
+  openTrades: [], closedTrades: [], watchlist: [], alerts: [
+    {icon:'⚠️', text:'<span class="alert-sym">OFFLINE</span> Flask API not reachable — showing empty state', time:'now'}
   ],
   chargesFormula: [
     {lbl:'Brokerage', val:'0.03% per leg, capped ₹20'},
@@ -646,29 +601,56 @@ const MOCK = {
 };
 
 // ── STATE ──────────────────────────────────────────────────
-let state = {
-  data: null,
-  activeTab: 'watchlist',
-  lastRefresh: null,
-};
+let state = { data: null, activeTab: 'watchlist', lastRefresh: null, usingLive: false };
 
-// ── API (replace mock with real calls) ─────────────────────
+// ── API FETCH (FIX-14: real API first, MOCK as fallback) ────
 async function fetchBotState() {
-  // When Flask API is running, uncomment:
-  // try { const r = await fetch('/api/state'); return await r.json(); } catch {}
-  // For now, simulate small LTP drift on each refresh
-  const d = JSON.parse(JSON.stringify(MOCK));
-  d.openTrades.forEach(t => {
-    t.ltp = t.ltp + (Math.random() - 0.5) * t.atr * 0.1;
-    t.ltp = Math.round(t.ltp * 100) / 100;
-  });
-  d.watchlist.forEach(w => {
-    w.ltp = w.ltp + (Math.random() - 0.5) * w.ltp * 0.0005;
-    w.ltp = Math.round(w.ltp * 100) / 100;
-  });
-  d.nifty.ltp = d.nifty.ltp + (Math.random() - 0.5) * 15;
-  d.nifty.ltp = Math.round(d.nifty.ltp * 100) / 100;
-  return d;
+  try {
+    const r = await fetch('/api/state');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    state.usingLive = true;
+    // Normalise fields that the render functions expect
+    // /api/state returns closedTrades with field names from _build_closed_trades()
+    // openTrades come from state.json via _build_open_trades()
+    d.openTrades  = d.openTrades  || [];
+    d.closedTrades= (d.closedTrades || []).map(t => ({
+      ts:      t.ts      || '',
+      symbol:  t.symbol  || '',
+      sector:  t.sector  || SECTOR_MAP[t.symbol] || 'UNKNOWN',
+      side:    t.side    || 'LONG',
+      qty:     t.qty     || 0,
+      entry:   t.entry   || 0,
+      exit:    t.exit    || 0,
+      hold:    t.hold    || 0,
+      reason:  t.reason  || '',
+      gross:   t.gross   || 0,
+      charges: t.charges || 0,
+      net:     t.net     || 0,
+      prob:    t.prob    || 0,
+      rr:      t.rr      || 0,
+      regime:  t.regime  || '',
+    }));
+    d.watchlist   = (d.watchlist || []).map(w => ({
+      s:    w.symbol || w.s || '',
+      ltp:  w.ltp   || 0,
+      chg:  w.chg   || 0,
+      sig:  w.signal || w.sig || 'HOLD',
+      conf: w.conf  || 0,
+      sl:   w.sl    || 0,
+      tp:   w.target|| w.tp || 0,
+      rr:   w.rr    || 0,
+    }));
+    d.nifty = d.nifty || { ltp:0, chg:0, atr:0, rsi:50, ema20:'above', regime:'neutral' };
+    d.alerts= d.alerts || [];
+    d.chargesFormula = d.chargesFormula || MOCK.chargesFormula;
+    return d;
+  } catch(e) {
+    console.warn('API fetch failed, using empty state:', e.message);
+    state.usingLive = false;
+    return JSON.parse(JSON.stringify(MOCK));
+  }
 }
 
 // ── HELPERS ────────────────────────────────────────────────
@@ -679,9 +661,14 @@ const pnlClass = (n) => n > 0 ? 'pnl-pos' : n < 0 ? 'pnl-neg' : '';
 const chgClass = (n) => n > 0 ? 'chg-up'  : n < 0 ? 'chg-dn'  : 'chg-nu';
 const colorClass = (n) => n > 0 ? 'pos' : n < 0 ? 'neg' : 'neu';
 
-function holdStr(openTime) {
-  // openTime is 'HH:MM' string from mock; in real mode it's ISO datetime
-  const [h,m] = openTime.split(':').map(Number);
+function holdStr(t) {
+  // t.holdMinutes from state.json (FIX-13), or compute from openTime string
+  if (t.holdMinutes !== undefined) {
+    const mins = Math.round(t.holdMinutes);
+    if (mins < 60) return mins + 'm';
+    return Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
+  }
+  const [h,m] = (t.openTime||'09:15').split(':').map(Number);
   const now = new Date();
   const open = new Date(); open.setHours(h, m, 0);
   const mins = Math.round((now - open) / 60000);
@@ -689,22 +676,12 @@ function holdStr(openTime) {
   return Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
 }
 
-function progressPct(entry, ltp, sl, target) {
-  const range = target - sl;
+function progressPct(t) {
+  // Use pre-computed value from state.json if available (FIX-13)
+  if (t.progressPct !== undefined) return t.progressPct;
+  const range = t.target - t.sl;
   if (range <= 0) return 0;
-  return Math.max(0, Math.min(100, ((ltp - sl) / range) * 100));
-}
-
-function sparkline(vals, w=120, h=28, col) {
-  if (!vals || vals.length < 2) return '';
-  const mn = Math.min(...vals), mx = Math.max(...vals);
-  const range = mx - mn || 1;
-  const pts = vals.map((v,i) => {
-    const x = (i / (vals.length-1)) * w;
-    const y = h - ((v - mn) / range) * h;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(' ');
-  return `<svg width="${w}" height="${h}" class="sparkline"><polyline points="${pts}" fill="none" stroke="${col||'var(--accent)'}" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
+  return Math.max(0, Math.min(100, ((t.ltp - t.sl) / range) * 100));
 }
 
 function confClass(p) {
@@ -726,7 +703,6 @@ function updateClock() {
   const mm = String(ist.getMinutes()).padStart(2,'0');
   const ss = String(ist.getSeconds()).padStart(2,'0');
   document.getElementById('clock').textContent = `${hh}:${mm}:${ss} IST`;
-
   const t = ist.getHours() * 60 + ist.getMinutes();
   const open = 9*60+15, close = 15*60+30;
   const mEl = document.getElementById('marketStatus');
@@ -741,22 +717,31 @@ setInterval(updateClock, 1000); updateClock();
 // ── RENDER FUNCTIONS ───────────────────────────────────────
 
 function renderHeader(d) {
-  // Mode badge
+  // API indicator
+  const ind = document.getElementById('apiIndicator');
+  if (state.usingLive) {
+    ind.className = 'api-indicator api-live'; ind.textContent = '● LIVE';
+  } else {
+    ind.className = 'api-indicator api-mock'; ind.textContent = '● MOCK';
+  }
+
   const mb = document.getElementById('modeBadge');
-  mb.textContent = d.mode.toUpperCase();
-  mb.className = 'badge badge-' + d.mode;
+  mb.textContent = (d.mode||'paper').toUpperCase();
+  mb.className = 'badge badge-' + (d.mode||'paper');
   const hb = document.getElementById('haltBadge');
   hb.style.display = d.halted ? 'inline-flex' : 'none';
 
-  // Stats
   document.getElementById('hOpenTrades').textContent = d.openTrades.length;
-  const netPnl = d.closedTrades.reduce((s,t) => s + t.net, 0)
-    + d.openTrades.reduce((s,t) => s + (t.ltp - t.entry) * t.qty, 0);
+
+  // Net P&L: use unrealisedPnl from state.json + closed net from CSV
+  const closedNet   = d.closedTrades.reduce((s,t) => s + (t.net||0), 0);
+  const unrealised  = d.openTrades.reduce((s,t) => s + (t.unrealisedPnl !== undefined ? t.unrealisedPnl : (t.ltp - t.entry) * t.qty), 0);
+  const netPnl = closedNet + unrealised;
   const dp = document.getElementById('hDailyPnl');
   dp.textContent = fmt(netPnl);
   dp.className = 'hstat-val ' + colorClass(netPnl);
 
-  const wins = d.closedTrades.filter(t => t.net > 0).length;
+  const wins  = d.closedTrades.filter(t => (t.net||0) > 0).length;
   const total = d.closedTrades.length;
   document.getElementById('hWinRate').textContent = total ? Math.round(wins/total*100)+'%' : '—';
 }
@@ -765,10 +750,9 @@ function renderBotStatus(d) {
   const icon = document.getElementById('botIcon');
   const mode = document.getElementById('botMode');
   icon.className = 'bot-status-icon ' + (d.halted ? 'halted' : 'running');
-  mode.textContent = d.mode.toUpperCase() + ' MODE' + (d.halted ? ' ⚠ HALTED' : '');
+  mode.textContent = (d.mode||'paper').toUpperCase() + ' MODE' + (d.halted ? ' ⚠ HALTED' : '');
 
-  // Risk meters
-  const netPnl = d.closedTrades.reduce((s,t) => s + t.net, 0);
+  const netPnl = d.closedTrades.reduce((s,t) => s + (t.net||0), 0);
   const dailyLossPct = Math.max(0, -netPnl) / CONFIG.maxDailyLoss * 100;
   document.getElementById('riskDailyFill').style.width = Math.min(100, dailyLossPct) + '%';
   document.getElementById('riskDailyFill').style.background = dailyLossPct > 80 ? 'var(--red)' : dailyLossPct > 50 ? 'var(--yellow)' : 'var(--green)';
@@ -784,17 +768,18 @@ function renderBotStatus(d) {
 }
 
 function renderNifty(d) {
-  const n = d.nifty;
-  document.getElementById('niftyLtp').textContent = fmtN(n.ltp);
+  const n = d.nifty || {};
+  document.getElementById('niftyLtp').textContent = n.ltp ? fmtN(n.ltp) : '—';
   const chgEl = document.getElementById('niftyChg');
-  chgEl.textContent = fmtPct(n.chg/100);
+  chgEl.textContent = n.chg ? fmtPct(n.chg/100) : '—';
   chgEl.className = 'nifty-stat-v ' + (n.chg >= 0 ? 'pos' : 'neg');
-  document.getElementById('niftyAtr').textContent = n.atr.toFixed(2) + '%';
-  document.getElementById('niftyEma').textContent = n.ema20.charAt(0).toUpperCase() + n.ema20.slice(1) + ' EMA20';
-  document.getElementById('regimeRsi').textContent = 'RSI ' + n.rsi.toFixed(1);
+  document.getElementById('niftyAtr').textContent = n.atr ? n.atr.toFixed(2) + '%' : '—';
+  document.getElementById('niftyEma').textContent = n.ema20 ? (n.ema20.charAt(0).toUpperCase() + n.ema20.slice(1) + ' EMA20') : '—';
+  document.getElementById('regimeRsi').textContent = n.rsi ? ('RSI ' + n.rsi.toFixed(1)) : 'RSI —';
   const rp = document.getElementById('regimePill');
-  rp.className = 'regime-pill ' + regimeClass(n.regime);
-  rp.textContent = regimeLabel(n.regime);
+  const regime = n.regime || 'neutral';
+  rp.className = 'regime-pill ' + regimeClass(regime);
+  rp.textContent = regimeLabel(regime);
   document.getElementById('niftyRefreshed').textContent = new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
 }
 
@@ -824,7 +809,7 @@ function renderSectors(d) {
 }
 
 function renderAlerts(d) {
-  const html = d.alerts.map(a => `
+  const html = (d.alerts||[]).map(a => `
     <div class="alert-item">
       <div class="alert-icon">${a.icon}</div>
       <div class="alert-text">${a.text}</div>
@@ -834,12 +819,12 @@ function renderAlerts(d) {
 }
 
 function renderKPIs(d) {
-  const closedNetPnl   = d.closedTrades.reduce((s,t) => s + t.net, 0);
-  const closedGrossPnl = d.closedTrades.reduce((s,t) => s + t.gross, 0);
-  const totalCharges   = d.closedTrades.reduce((s,t) => s + t.charges, 0);
-  const unrealised     = d.openTrades.reduce((s,t) => s + (t.ltp - t.entry) * t.qty, 0);
-  const wins   = d.closedTrades.filter(t => t.net > 0).length;
-  const losses = d.closedTrades.filter(t => t.net <= 0).length;
+  const closedNetPnl   = d.closedTrades.reduce((s,t) => s + (t.net||0), 0);
+  const closedGrossPnl = d.closedTrades.reduce((s,t) => s + (t.gross||0), 0);
+  const totalCharges   = d.closedTrades.reduce((s,t) => s + (t.charges||0), 0);
+  const unrealised     = d.openTrades.reduce((s,t) => s + (t.unrealisedPnl !== undefined ? t.unrealisedPnl : (t.ltp - t.entry) * t.qty), 0);
+  const wins   = d.closedTrades.filter(t => (t.net||0) > 0).length;
+  const losses = d.closedTrades.filter(t => (t.net||0) <= 0).length;
   const wr     = wins + losses > 0 ? (wins/(wins+losses)*100).toFixed(0)+'%' : '—';
 
   const kNP = document.getElementById('kpiNetPnl');
@@ -858,7 +843,6 @@ function renderKPIs(d) {
   document.getElementById('kpiTrades').textContent = wins + 'W / ' + losses + 'L';
   document.getElementById('kpiWinRate').textContent = 'Win Rate: ' + wr;
 
-  // P&L bars
   const pnlBig = document.getElementById('pnlBigDaily');
   pnlBig.textContent = fmt(closedNetPnl);
   pnlBig.className = 'pnl-big ' + colorClass(closedNetPnl);
@@ -867,12 +851,12 @@ function renderKPIs(d) {
   barD.style.width = lossUsed + '%';
   barD.style.background = lossUsed > 70 ? 'var(--red)' : 'var(--green)';
 
-  // Paper PnL (all trades)
+  // Session P&L = closed net + unrealised
   const paperTotal = closedNetPnl + unrealised;
-  document.getElementById('pnlBigPaper').textContent = fmt(paperTotal);
-  document.getElementById('pnlBigPaper').className = 'pnl-big ' + colorClass(paperTotal);
+  const pnlPaper = document.getElementById('pnlBigPaper');
+  pnlPaper.textContent = fmt(paperTotal);
+  pnlPaper.className = 'pnl-big ' + colorClass(paperTotal);
 
-  // Circuit breaker
   const cbDot = document.getElementById('cbDot');
   const cbSt  = document.getElementById('cbStatus');
   if (d.halted) {
@@ -895,24 +879,24 @@ function renderOpenPositions(d) {
   empty.style.display = 'none'; tbl.style.display = 'table';
 
   tbody.innerHTML = d.openTrades.map(t => {
-    const unrealised = (t.ltp - t.entry) * t.qty;
-    const grossPnl   = unrealised;
-    const charges    = (t.entry * t.qty * 0.0015 + t.ltp * t.qty * 0.001); // rough estimate
-    const netEst     = grossPnl - charges;
-    const pct        = progressPct(t.entry, t.ltp, t.sl, t.target);
-    const ltpChg     = (t.ltp - t.entry) / t.entry * 100;
+    // Use pre-computed values from state.json (FIX-13) with fallbacks
+    const unrealised = t.unrealisedPnl !== undefined ? t.unrealisedPnl : (t.ltp - t.entry) * t.qty;
+    const charges    = (t.entry * t.qty * 0.0015 + t.ltp * t.qty * 0.001);
+    const netEst     = unrealised - charges;
+    const pct        = progressPct(t);
+    const ltpChg     = t.ltp > 0 ? (t.ltp - t.entry) / t.entry * 100 : 0;
     const ltpClass   = ltpChg >= 0 ? 'chg-up' : 'chg-dn';
-    const col        = SECTOR_COLORS[t.sector] || 'var(--text2)';
+    const ltpDisplay = t.ltp > 0 ? fmtN(t.ltp) : '—';
     return `<tr>
-      <td class="sym-cell">${t.symbol}<small>${t.sector} · ${t.side}</small></td>
+      <td class="sym-cell">${t.symbol}<small>${t.sector||SECTOR_MAP[t.symbol]||''} · ${t.side}</small></td>
       <td class="ltp-cell">
-        <div class="${ltpClass}">${fmtN(t.ltp)}</div>
-        <div style="font-size:10px" class="${ltpClass}">${ltpChg >= 0 ? '↑' : '↓'} ${Math.abs(ltpChg).toFixed(2)}%</div>
+        <div class="${ltpClass}">${ltpDisplay}</div>
+        <div style="font-size:10px" class="${ltpClass}">${t.ltp>0?(ltpChg>=0?'↑':'↓')+Math.abs(ltpChg).toFixed(2)+'%':''}</div>
       </td>
       <td>${fmtN(t.entry)}</td>
       <td class="neg">${fmtN(t.sl)}</td>
       <td class="pos">${fmtN(t.target)}</td>
-      <td style="color:${t.trailCount>0?'var(--yellow)':'var(--text3)'}">${fmtN(t.trailSl)}<br><span style="font-size:9px;color:var(--text3)">×${t.trailCount}</span></td>
+      <td style="color:${t.trailCount>0?'var(--yellow)':'var(--text3)'}">${fmtN(t.trailSl||t.sl)}<br><span style="font-size:9px;color:var(--text3)">×${t.trailCount||0}</span></td>
       <td>
         <div class="progress-wrap">
           <div class="progress-track"><div class="progress-fill ${pct>=50?'win':'loss'}" style="width:${pct.toFixed(0)}%"></div></div>
@@ -922,69 +906,71 @@ function renderOpenPositions(d) {
       <td>${t.qty}</td>
       <td class="${pnlClass(unrealised)}">${fmt(unrealised)}</td>
       <td class="${pnlClass(netEst)}">${fmt(netEst)}<br><span style="font-size:9px;color:var(--text3)">-₹${charges.toFixed(0)} chg</span></td>
-      <td>${holdStr(t.openTime)}<br><span style="font-size:9px;color:var(--text3)">${t.candles}c</span></td>
+      <td>${holdStr(t)}<br><span style="font-size:9px;color:var(--text3)">${t.candles||0}c</span></td>
       <td>
         <div class="conf-bar">
           <div class="conf-track"><div class="conf-fill ${confClass(t.prob)}" style="width:${(t.prob*100).toFixed(0)}%"></div></div>
           <span style="font-size:10px">${(t.prob*100).toFixed(0)}%</span>
         </div>
       </td>
-      <td style="color:var(--accent)">${t.rr.toFixed(2)}x</td>
-      <td><span class="tag">${t.regime}</span></td>
+      <td style="color:var(--accent)">${(t.rr||0).toFixed(2)}x</td>
+      <td><span class="tag">${t.regime||'paper'}</span></td>
     </tr>`;
   }).join('');
 }
 
 function renderWatchlist(d) {
   const openSyms = new Set(d.openTrades.map(t => t.symbol));
+  if (!d.watchlist || d.watchlist.length === 0) {
+    document.getElementById('watchlistTbody').innerHTML =
+      '<tr><td colspan="11" class="empty-state">Watchlist data loading...</td></tr>';
+    return;
+  }
   document.getElementById('watchlistTbody').innerHTML = d.watchlist.map(w => {
-    const sec = SECTOR_MAP[w.s] || '—';
-    const tier = TIER_MAP[w.s] || '—';
+    const sym  = w.s || w.symbol || '';
+    const sec  = SECTOR_MAP[sym] || w.sector || '—';
+    const tier = TIER_MAP[sym] || '—';
     const col  = SECTOR_COLORS[sec] || 'var(--text2)';
-    const isOpen = openSyms.has(w.s);
-    const sig = isOpen ? 'OPEN' : w.sig;
-    const badgeCls = sig === 'BUY' ? 'wl-badge-buy' : sig === 'SELL' ? 'wl-badge-sell' : sig === 'OPEN' ? 'wl-badge-open' : 'wl-badge-hold';
+    const isOpen = openSyms.has(sym);
+    const sig = isOpen ? 'OPEN' : (w.sig || w.signal || 'HOLD');
+    const badgeCls = sig==='BUY'?'wl-badge-buy':sig==='SELL'?'wl-badge-sell':sig==='OPEN'?'wl-badge-open':'wl-badge-hold';
+    const ltp  = w.ltp || 0;
+    const conf = w.conf || 0;
+    const chg  = w.chg  || 0;
     return `<tr class="${isOpen?'open-pos-row':''}">
-      <td class="sym-cell" style="color:${isOpen?'var(--accent)':''}">${w.s}${isOpen?' 📌':''}</td>
+      <td class="sym-cell" style="color:${isOpen?'var(--accent)':''}">${sym}${isOpen?' 📌':''}</td>
       <td><span style="color:${col};font-weight:600;font-size:11px">${sec}</span></td>
       <td><span class="tag" style="color:${tier==='A'?'var(--yellow)':'var(--text3)'}">${tier}</span></td>
-      <td class="ltp-cell">${fmtN(w.ltp)}</td>
-      <td class="${chgClass(w.chg)}">${w.chg>=0?'+':''}${w.chg.toFixed(2)}%</td>
+      <td class="ltp-cell">${ltp ? fmtN(ltp) : '—'}</td>
+      <td class="${chgClass(chg)}">${chg>=0?'+':''}${chg.toFixed(2)}%</td>
       <td><span class="wl-badge ${badgeCls}">${sig}</span></td>
       <td>
         <div class="conf-bar" style="width:120px">
-          <div class="conf-track"><div class="conf-fill ${confClass(w.conf)}" style="width:${(w.conf*100).toFixed(0)}%"></div></div>
-          <span style="font-size:10px">${(w.conf*100).toFixed(0)}%</span>
+          <div class="conf-track"><div class="conf-fill ${confClass(conf)}" style="width:${(conf*100).toFixed(0)}%"></div></div>
+          <span style="font-size:10px">${(conf*100).toFixed(0)}%</span>
         </div>
       </td>
-      <td class="neg">${fmtN(w.sl)}</td>
-      <td class="pos">${fmtN(w.tp)}</td>
-      <td style="color:var(--accent)">${w.rr.toFixed(2)}x</td>
+      <td class="neg">${w.sl ? fmtN(w.sl) : '—'}</td>
+      <td class="pos">${(w.tp||w.target) ? fmtN(w.tp||w.target) : '—'}</td>
+      <td style="color:var(--accent)">${(w.rr||0).toFixed(2)}x</td>
       <td style="font-size:10px;color:var(--text3)">${isOpen?'<span style="color:var(--green)">● IN POSITION</span>':'<span style="color:var(--muted)">● MONITORING</span>'}</td>
     </tr>`;
   }).join('');
 }
 
 function renderClosedTrades(d) {
-  const cnt = document.getElementById('closedCount');
+  const cnt   = document.getElementById('closedCount');
   const empty = document.getElementById('closedEmpty');
   const tbody = document.getElementById('closedTbody');
   cnt.textContent = d.closedTrades.length + ' trades';
-
   if (d.closedTrades.length === 0) {
     empty.style.display = 'block'; tbody.innerHTML = ''; return;
   }
   empty.style.display = 'none';
-
   const reasonColors = {
-    TARGET_HIT:     'var(--green)',
-    SL_HIT:         'var(--red)',
-    SIGNAL_FLIP:    'var(--yellow)',
-    MOMENTUM_FAILURE:'var(--orange)',
-    ROTATION_BETTER_SIGNAL: 'var(--accent2)',
-    AUTO_EXIT_EOD:  'var(--muted)',
+    TARGET_HIT:'var(--green)', SL_HIT:'var(--red)', SIGNAL_FLIP:'var(--yellow)',
+    MOMENTUM_FAILURE:'var(--orange)', ROTATION_BETTER_SIGNAL:'var(--accent2)', AUTO_EXIT_EOD:'var(--muted)',
   };
-
   tbody.innerHTML = d.closedTrades.map(t => {
     const col = SECTOR_COLORS[t.sector] || 'var(--text2)';
     const rc  = reasonColors[t.reason] || 'var(--text3)';
@@ -997,23 +983,22 @@ function renderClosedTrades(d) {
       <td>${fmtN(t.entry)}</td>
       <td>${fmtN(t.exit)}</td>
       <td>${t.hold}m</td>
-      <td><span style="color:${rc};font-size:11px">${t.reason.replace(/_/g,' ')}</span></td>
+      <td><span style="color:${rc};font-size:11px">${(t.reason||'').replace(/_/g,' ')}</span></td>
       <td class="${pnlClass(t.gross)}">${fmt(t.gross)}</td>
-      <td class="neg" style="font-size:11px">-₹${t.charges}</td>
+      <td class="neg" style="font-size:11px">-₹${(t.charges||0).toFixed(0)}</td>
       <td class="${pnlClass(t.net)}">${fmt(t.net)}</td>
       <td style="font-size:10px">${(t.prob*100).toFixed(0)}%</td>
-      <td style="color:var(--accent)">${t.rr.toFixed(2)}x</td>
-      <td><span class="tag">${t.regime.replace('_conf','')}</span></td>
+      <td style="color:var(--accent)">${(t.rr||0).toFixed(2)}x</td>
+      <td><span class="tag">${(t.regime||'').replace('_conf','')}</span></td>
     </tr>`;
   }).join('');
 }
 
 function renderCharges(d) {
-  const total  = d.closedTrades.reduce((s,t) => s + t.charges, 0);
-  const gross  = d.closedTrades.reduce((s,t) => s + t.gross, 0);
-  const net    = d.closedTrades.reduce((s,t) => s + t.net, 0);
+  const total  = d.closedTrades.reduce((s,t) => s + (t.charges||0), 0);
+  const gross  = d.closedTrades.reduce((s,t) => s + (t.gross||0), 0);
+  const net    = d.closedTrades.reduce((s,t) => s + (t.net||0), 0);
   const trades = d.closedTrades.length;
-
   document.getElementById('chargeCards').innerHTML = `
     <div class="kpi">
       <div class="kpi-val">${fmt(total)}</div>
@@ -1031,8 +1016,7 @@ function renderCharges(d) {
       <div class="kpi-sub">After all Dhan charges</div>
     </div>
   `;
-
-  document.getElementById('formulaGrid').innerHTML = d.chargesFormula.map(f => `
+  document.getElementById('formulaGrid').innerHTML = (d.chargesFormula||[]).map(f => `
     <div class="charge-row" style="border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px">
       <div class="charge-lbl">${f.lbl}</div>
       <div style="font-weight:600;font-size:12px">${f.val}</div>
@@ -1076,10 +1060,7 @@ function switchTab(name, el) {
 setInterval(refreshAll, CONFIG.scanInterval);
 
 // ── INIT ───────────────────────────────────────────────────
-(async () => {
-  const d = await fetchBotState();
-  renderAll(d);
-})();
+(async () => { const d = await fetchBotState(); renderAll(d); })();
 </script>
 </body>
 </html>
