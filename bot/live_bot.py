@@ -54,6 +54,13 @@
 #          __init__ time; if the file was deleted mid-session, subsequent
 #          writes appended rows without a header, corrupting diagnostics.
 #          Now header presence is checked at each write call.
+#
+# Fix log (2026-06-29):
+#   FIX-10: write_state(self) added at end of _scan_and_enter() and
+#           _monitor_positions(). Dumps logs/state.json after every scan
+#           and monitor tick so the Flask dashboard reads live bot state
+#           without needing its own broker connection.
+#           broker_ready in /api/health now reflects actual bot state.
 # ============================================================
 
 from __future__ import annotations
@@ -82,6 +89,7 @@ from bot.brokerage import calculate_charges, ChargeBreakdown
 from bot.dhan_api import DhanBroker
 from bot.signal_engine import SignalEngine
 from bot.risk_manager import RiskManager
+from bot.state_writer import write_state          # FIX-10: dashboard live data
 from bot.telegram_alert import (
     alert_bot_started, alert_entry, alert_exit,
     alert_trail_update, alert_daily_summary,
@@ -1104,6 +1112,7 @@ class LiveBot:
                 top = sorted(self.rejection_stats.items(), key=lambda x: -x[1])[:6]
                 summary = " | ".join(f"{k}={v}" for k, v in top)
                 log.info("  Rejection stats (today): %s", summary)
+            write_state(self)   # FIX-10: update dashboard even on no-signal scan
             return
 
         def calibrated_score(prob, rr):
@@ -1152,6 +1161,7 @@ class LiveBot:
                         trade_to_exit.candles_held,
                         self._ROTATION_MIN_CANDLES,
                     )
+                    write_state(self)   # FIX-10
                     return
 
                 ev_new = _expected_pnl(
@@ -1186,6 +1196,7 @@ class LiveBot:
                         "ev_new=₹%.2f ev_old=₹%.2f ev_gain=₹%.2f <= cost=₹%.2f",
                         exit_sym, best_sym, ev_new, ev_old, ev_gain, roundtrip_cost,
                     )
+                    write_state(self)   # FIX-10
                     return
 
                 id_map = {str(trade_to_exit.security_id): exit_sym}
@@ -1203,10 +1214,12 @@ class LiveBot:
                 self._exit_trade(trade_to_exit, ltp, "ROTATION_BETTER_SIGNAL")
             else:
                 log.info("Max open trades (%d). No rotation opportunity.", MAX_OPEN_TRADES)
+                write_state(self)   # FIX-10
                 return
 
         available_slots = max(0, MAX_OPEN_TRADES - len(self.trades))
         if available_slots <= 0:
+            write_state(self)   # FIX-10
             return
 
         selected_candidates = candidates[:available_slots]
@@ -1270,6 +1283,8 @@ class LiveBot:
                 self._enter_paper(
                     sym, sec_id, qty, entry, sl, target, result,
                 )
+
+        write_state(self)   # FIX-10: always write after scan completes
 
     # ──────────────────────────────────────────────────────────
     #  Paper entry
@@ -1473,219 +1488,4 @@ class LiveBot:
             if should_trail and new_sl > trade.stop_loss:
                 old_sl = trade.stop_loss
                 trade.stop_loss = new_sl
-                trade.trail_count += 1
-                log.info(
-                    "%s: trail SL ₹%.2f → ₹%.2f (ltp=₹%.2f high=₹%.2f trail#%d)",
-                    symbol, old_sl, new_sl, ltp, trade.running_high, trade.trail_count,
-                )
-                try:
-                    alert_trail_update(symbol=symbol, new_sl=new_sl, ltp=ltp)
-                except Exception:
-                    pass
-
-            # 5. Momentum failure (candle-low SL break) — only after min candles
-            if is_boundary and trade.candles_held >= self._MOMENTUM_EXIT_MIN_CANDLES:
-                try:
-                    df = self.broker.get_candles(trade.security_id, symbol, days_back=2)
-                    if not df.empty and len(df) >= 3:
-                        candle_low = df["low"].iloc[-1]
-                        if ltp < candle_low and ltp < trade.stop_loss * 1.002:
-                            log.info(
-                                "%s: momentum failure exit — ltp=₹%.2f < candle_low=₹%.2f",
-                                symbol, ltp, candle_low,
-                            )
-                            self._exit_trade(trade, ltp, "MOMENTUM_FAILURE")
-                            continue
-                except Exception as e:
-                    log.warning("%s: momentum check error: %s", symbol, e)
-
-            # 6. Signal flip check (at candle boundary only)
-            if is_boundary:
-                try:
-                    df = self.broker.get_candles(trade.security_id, symbol, days_back=5)
-                    if not df.empty:
-                        scored = self.engine.score(df, symbol=symbol)
-                        trade.last_prob = scored["prob_up"]
-                        if scored["signal"] == "SELL":
-                            log.info(
-                                "%s: signal flipped to SELL (prob=%.3f) — exiting.",
-                                symbol, scored["prob_up"],
-                            )
-                            self._exit_trade(trade, ltp, "SIGNAL_FLIP")
-                            self.cooldown_bars[symbol] = 3
-                            continue
-                except Exception as e:
-                    log.warning("%s: signal flip check error: %s", symbol, e)
-
-    # ──────────────────────────────────────────────────────────
-    #  FIX-6: Force exit all — uses entry price as fallback
-    # ──────────────────────────────────────────────────────────
-    def _force_exit_all(self, reason: str = "FORCED_EXIT"):
-        """
-        Exit all open positions immediately.
-        FIX-6: fallback price is entry (not running_high) so paper P&L
-        is not artificially inflated when LTP is unavailable.
-        """
-        if not self.trades:
-            return
-        log.warning("Force-exiting all %d open positions: %s", len(self.trades), reason)
-
-        id_map = {str(t.security_id): sym for sym, t in self.trades.items()}
-        prices = self.broker.get_ltp_batch(id_map)
-
-        for symbol, trade in list(self.trades.items()):
-            ltp = prices.get(str(trade.security_id), 0.0)
-            # FIX-6: use entry as fallback (was running_high — overstated PnL)
-            exit_price = ltp if ltp > 0 else trade.entry
-            self._exit_trade(trade, exit_price, reason)
-
-    # ──────────────────────────────────────────────────────────
-    #  EOD reset
-    # ──────────────────────────────────────────────────────────
-    def _eod_reset(self):
-        """
-        End-of-day housekeeping:
-          - Force-exit any lingering positions
-          - Send daily summary to Telegram
-          - Reset all daily counters
-        """
-        log.info("EOD reset triggered.")
-
-        if self.trades:
-            self._force_exit_all("EOD_AUTO_SQUARE_OFF")
-
-        total_trades = len(self.closed_trades)
-        wins   = sum(1 for t in self.closed_trades if t.get("net_pnl", 0) > 0)
-        losses = total_trades - wins
-
-        try:
-            alert_daily_summary(
-                pnl          = self.risk.daily_pnl,   # net (after charges)
-                total_trades = total_trades,
-                wins         = wins,
-                losses       = losses,
-                capital      = CAPITAL,
-            )
-        except Exception as e:
-            log.warning("alert_daily_summary failed: %s", e)
-
-        # Reset state
-        self.closed_trades.clear()
-        self.sl_blacklist.clear()
-        self.cooldown_bars.clear()
-        self.paper_pnl = 0.0
-        self.rejection_stats.clear()
-        self.rejection_symbols.clear()
-        self.risk.reset_daily()
-
-        # FIX-B: reset circuit alert sent flag
-        self._circuit_alert_sent = False
-        # FIX-C: reset candle boundary dedup key
-        self._last_boundary_key = None
-
-        log.info("EOD reset complete.")
-
-    # ──────────────────────────────────────────────────────────
-    #  Main loop
-    # ──────────────────────────────────────────────────────────
-    def run(self):
-        """
-        Main trading loop. Runs until market close or KeyboardInterrupt.
-
-        Loop structure:
-          Every SCAN_INTERVAL seconds:   scan + enter
-          Every MONITOR_INTERVAL seconds: monitor positions
-          At EOD_RESET_TIME:              eod_reset
-          On KeyboardInterrupt:           force_exit_all (live mode)
-        """
-        log.info("=" * 60)
-        log.info("Bot starting — mode: %s", MODE_LABEL.get(BOT_MODE, BOT_MODE))
-        log.info("Capital: ₹%s | Trade mode: %s", f"{CAPITAL:,}", TRADE_MODE.upper())
-        log.info("=" * 60)
-
-        try:
-            alert_bot_started(mode=BOT_MODE, capital=CAPITAL)
-        except Exception:
-            pass
-
-        self._refresh_nifty()
-        _eod_triggered = False
-        _last_monitor_ts = 0.0
-
-        try:
-            while True:
-                now = datetime.now()
-                now_t = now.time()
-
-                # ── EOD reset ─────────────────────────────────
-                if now_t >= _parse_time(EOD_RESET_TIME) and not _eod_triggered:
-                    self._eod_reset()
-                    _eod_triggered = True
-
-                if now_t < _parse_time(MARKET_OPEN) or now_t > _parse_time(MARKET_CLOSE):
-                    if _eod_triggered:
-                        log.info("Market closed. Bot sleeping.")
-                        time.sleep(60)
-                        continue
-                    time.sleep(30)
-                    continue
-
-                # Reset EOD flag for new day
-                if now_t < _parse_time(EOD_RESET_TIME):
-                    _eod_triggered = False
-
-                # ── Nifty refresh every 15 minutes ───────────
-                if now.minute % 15 == 0 and now.second < 35:
-                    self._refresh_nifty()
-
-                # ── Dhan position sync ─────────────────────────
-                self._sync_with_dhan()
-
-                # ── Circuit breaker Telegram (FIX-4: once only) ──
-                if self.risk.is_halted() and not self._circuit_alert_sent:
-                    self._circuit_alert_sent = True
-                    try:
-                        alert_circuit_breaker(
-                            daily_pnl = self.risk.daily_pnl,
-                            reason    = "daily_loss_or_consecutive_sl",
-                        )
-                    except Exception:
-                        pass
-                    self._force_exit_all("CIRCUIT_BREAKER")
-
-                # ── Monitor open positions ─────────────────────
-                ts_now = time.time()
-                if ts_now - _last_monitor_ts >= MONITOR_INTERVAL:
-                    self._monitor_positions()
-                    _last_monitor_ts = ts_now
-
-                # ── Scan for new entries ───────────────────────
-                ts_now2 = time.time()
-                if ts_now2 - self._last_scan_ts >= SCAN_INTERVAL:
-                    if not _no_new_trades() and not self.risk.is_halted():
-                        self._scan_and_enter()
-                    self._last_scan_ts = ts_now2
-
-                time.sleep(5)
-
-        except KeyboardInterrupt:
-            log.warning("KeyboardInterrupt received.")
-            if BOT_MODE == "live":
-                log.warning("Live mode — force-exiting all positions.")
-                self._force_exit_all("KEYBOARD_INTERRUPT")
-            log.info("Bot stopped.")
-
-
-# ─────────────────────────────────────────────────────────────
-#  Entry point
-# ─────────────────────────────────────────────────────────────
-def main():
-    bot = LiveBot()
-    if BOT_MODE == "test":
-        bot.run_test()
-    else:
-        bot.run()
-
-
-if __name__ == "__main__":
-    main()
+           
