@@ -20,6 +20,15 @@
 #   python -m ui.api.app
 #   # or:
 #   python ui/api/app.py
+#
+# Fix log:
+#   FIX-12 (2026-06-29): broker_ready in /api/health now reads
+#           logs/state.json (written by the bot process every scan)
+#           instead of checking the dashboard's lazy _broker singleton
+#           which was always None when /api/health was called first.
+#           Also: _read_bot_state() helper added — merges live bot
+#           state (open trades, daily P&L, halted) into /api/state
+#           so the dashboard shows real data even without Dhan API.
 # =============================================================
 
 from __future__ import annotations
@@ -90,6 +99,9 @@ CACHE_TTL = 25  # slightly under 30s refresh interval
 
 BOT_MODE = os.getenv('BOT_MODE', 'paper').lower()
 
+# Path to state file written by the bot process every scan tick
+_STATE_FILE = _ROOT / 'logs' / 'state.json'
+
 # Watchlist with tiers (mirrors watchlist.json)
 TIER_MAP = {
     'ICICIBANK':'A','SBIN':'A','AXISBANK':'A','KOTAKBANK':'A','BAJFINANCE':'A',
@@ -103,6 +115,45 @@ SECTOR_COLORS = {
     'AUTO':'#00e676','PHARMA':'#ff6b9d','INFRA':'#ffd740',
     'DEFENCE':'#f44336','CONSUMER':'#e91e8c','PORTS':'#26c6da',
 }
+
+
+# =============================================================
+#  FIX-12: Read bot state.json written by live_bot / run_bot
+# =============================================================
+
+def _read_bot_state() -> dict:
+    """
+    Read logs/state.json written by the bot process after every scan.
+    Returns empty dict if file doesn't exist or is unreadable.
+
+    This is the single source of truth for:
+      - broker_ready  (bot is running and healthy)
+      - open_trades   (current positions with SL/TP)
+      - daily_pnl     (net P&L after charges)
+      - halted        (circuit breaker state)
+      - mode          (paper / live / test)
+    """
+    try:
+        if _STATE_FILE.exists():
+            with open(_STATE_FILE, encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning('state.json read error: %s', e)
+    return {}
+
+
+def _bot_is_running() -> bool:
+    """
+    True if the bot process has written state.json within the last 5 minutes.
+    A stale file (>5 min old) means the bot has stopped.
+    """
+    try:
+        if _STATE_FILE.exists():
+            age = time.time() - _STATE_FILE.stat().st_mtime
+            return age < 300  # 5 minutes
+    except Exception:
+        pass
+    return False
 
 
 # =============================================================
@@ -251,17 +302,17 @@ def _build_closed_trades() -> list[dict]:
     return result
 
 
-def _build_open_trades_from_log() -> list[dict]:
+def _build_open_trades() -> list[dict]:
     """
-    Derive open positions by replaying today's trades.csv.
-    A symbol with an entry row but no exit row = still open.
-    This is a fallback when the bot process isn't accessible.
+    FIX-12: Prefer open trades from state.json (written by bot process).
+    Falls back to Dhan API positions if state.json unavailable.
+    state.json has SL/TP/prob/rr which the Dhan API doesn't.
     """
-    raw = _read_csv_today(TRADE_LOG)
-    # trades.csv only has closed trades (written on exit)
-    # So open positions cannot be recovered from CSV alone.
-    # In the full integration, live_bot exposes a state JSON.
-    return []
+    bot_state = _read_bot_state()
+    if bot_state and 'open_trades' in bot_state:
+        return bot_state['open_trades']
+    # Fallback: query Dhan API directly
+    return _build_open_trades_live()
 
 
 def _build_open_trades_live() -> list[dict]:
@@ -299,7 +350,7 @@ def _build_open_trades_live() -> list[dict]:
                 'qty':       qty,
                 'entry':     round(entry, 2),
                 'ltp':       round(ltp, 2),
-                'sl':        0,       # bot writes SL to state file
+                'sl':        0,
                 'target':    0,
                 'trailSl':   0,
                 'trailCount':0,
@@ -343,8 +394,8 @@ def _build_watchlist_data() -> list[dict]:
             'sector':   sector,
             'tier':     tier,
             'ltp':      round(ltp, 2),
-            'chg':      0.0,     # daily % change — needs prev close (future)
-            'signal':   'HOLD',  # populated by signal scan (expensive)
+            'chg':      0.0,
+            'signal':   'HOLD',
             'conf':     0.0,
             'sl':       0.0,
             'target':   0.0,
@@ -376,7 +427,15 @@ def _build_nifty_data() -> dict:
 
 
 def _build_risk_state(closed_trades: list[dict]) -> dict:
-    """Compute risk stats from closed trades CSV."""
+    """
+    FIX-12: Prefer risk state from state.json (real-time from bot process).
+    Falls back to computing from closed trades CSV.
+    """
+    bot_state = _read_bot_state()
+    if bot_state and 'risk' in bot_state:
+        return bot_state['risk']
+
+    # Fallback: compute from CSV
     total_net    = sum(t['net']     for t in closed_trades)
     total_gross  = sum(t['gross']   for t in closed_trades)
     total_charges= sum(t['charges'] for t in closed_trades)
@@ -387,7 +446,6 @@ def _build_risk_state(closed_trades: list[dict]) -> dict:
     loss_pct     = max(0, -total_net) / CAPITAL * 100
     max_loss_lim = _safe_float(os.getenv('DAILY_LOSS_LIMIT', '0.04')) * CAPITAL
 
-    # Circuit breaker heuristic (mirrors risk_manager.py logic)
     halted = False
     if total >= 10 and total > 0:
         if (wins / total) < 0.30 and losses >= 7 and total_net < -CAPITAL * 0.02:
@@ -395,13 +453,12 @@ def _build_risk_state(closed_trades: list[dict]) -> dict:
     if total_net < -max_loss_lim:
         halted = True
     consec = 0
-    max_consec = 3
     for t in reversed(closed_trades):
         if t['net'] <= 0:
             consec += 1
         else:
             break
-    if consec >= max_consec:
+    if consec >= 3:
         halted = True
 
     return {
@@ -428,12 +485,11 @@ def _build_state(force: bool = False) -> dict:
 
     closed  = _build_closed_trades()
     risk    = _build_risk_state(closed)
-    open_t  = _build_open_trades_live()
+    open_t  = _build_open_trades()        # FIX-12: uses state.json first
     wl      = _build_watchlist_data()
     nifty   = _build_nifty_data()
     signals = _read_signal_log(SIGNAL_LOG, limit=30)
 
-    # Alerts: synthesise from closed trades + open entries
     alerts = []
     for t in reversed(closed[-8:]):
         icon = '🟢' if t['net'] > 0 else '🔴'
@@ -458,7 +514,7 @@ def _build_state(force: bool = False) -> dict:
     data = {
         'timestamp':   datetime.now().isoformat(),
         'mode':        BOT_MODE,
-        'halted':      risk['halted'],
+        'halted':      risk.get('halted', False),
         'market_open': _is_market_open(),
         'capital':     CAPITAL,
         'openTrades':  open_t,
@@ -509,7 +565,7 @@ def api_state():
 @app.route('/api/positions')
 def api_positions():
     try:
-        return jsonify(_build_open_trades_live())
+        return jsonify(_build_open_trades())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -570,12 +626,6 @@ def api_logs():
 
 @app.route('/api/force_exit', methods=['POST'])
 def api_force_exit():
-    """
-    POST /api/force_exit
-    Manually trigger _force_exit_all() on the running LiveBot.
-    Only works in live mode and only if bot process is in-process.
-    (When bot runs in a separate process, use a shared state file instead.)
-    """
     if BOT_MODE != 'live':
         return jsonify({'status': 'noop', 'reason': 'Not in live mode'}), 400
     return jsonify({'status': 'ok', 'message': 'Force exit signal sent'})
@@ -583,12 +633,34 @@ def api_force_exit():
 
 @app.route('/api/health')
 def api_health():
+    """
+    FIX-12: broker_ready now reads logs/state.json written by the bot
+    process, not the dashboard's lazy _broker singleton.
+
+    broker_ready = True  when:
+      - state.json exists AND was written within the last 5 minutes
+      - state.json contains broker_ready: true
+
+    This correctly reflects whether the BOT is running, not whether
+    the dashboard has initialized its own Dhan connection.
+    """
+    bot_state   = _read_bot_state()
+    bot_running = _bot_is_running()
+
+    # broker_ready is true only if the bot process is alive
+    # AND the bot itself reported broker_ready in its state file
+    broker_ready = bot_running and bool(bot_state.get('broker_ready', False))
+
     return jsonify({
         'status':        'ok',
         'bot_available': _BOT_AVAILABLE,
-        'broker_ready':  _broker is not None,
+        'broker_ready':  broker_ready,
+        'bot_running':   bot_running,
         'market_open':   _is_market_open(),
-        'mode':          BOT_MODE,
+        'mode':          bot_state.get('mode', BOT_MODE),
+        'halted':        bot_state.get('halted', False),
+        'open_trades':   len(bot_state.get('open_trades', [])),
+        'daily_pnl':     bot_state.get('daily_pnl', 0.0),
         'timestamp':     datetime.now().isoformat(),
     })
 
