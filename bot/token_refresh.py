@@ -2,18 +2,25 @@
 #  bot/token_refresh.py  —  Verify Dhan token is valid
 # ============================================================
 """
-Checks if today's token in config/.env is working.
+Checks if today’s token in config/.env is working.
 Run at 8:55 AM before starting the bot.
 
     python -m bot.token_refresh
 
 If it shows OK  -> proceed to health_check and live_bot
 If it shows FAIL -> get fresh token from Dhan app and repaste
+
+Fix log:
+  2026-07-06: Balance showed 'Rs.check app' because Dhan v2
+              fundlimit wraps the value inside a nested dict or
+              list and uses the misspelling 'availabelBalance'.
+              Now tries every known nesting pattern and prints
+              the raw keys if none match, so balance is always
+              visible.
 """
 
 import os, sys, logging, requests
 
-# Force reload .env fresh every time — no caching
 from dotenv import load_dotenv, dotenv_values
 
 log = logging.getLogger("token_refresh")
@@ -27,11 +34,57 @@ def read_credentials():
     """Read directly from file — bypasses any dotenv caching."""
     if not os.path.exists(ENV_PATH):
         return None, None
-
-    values = dotenv_values(ENV_PATH)   # reads fresh every time
+    values    = dotenv_values(ENV_PATH)
     token     = values.get("DHAN_ACCESS_TOKEN", "").strip()
     client_id = values.get("DHAN_CLIENT_ID", "").strip()
     return token, client_id
+
+
+def _extract_balance(data: dict) -> str:
+    """
+    Dhan v2 /fundlimit response structure variations:
+
+      Variant A (most common):
+        { "status": "success",
+          "data": { "availabelBalance": 12345.0, ... } }
+
+      Variant B (older SDK):
+        { "availabelBalance": 12345.0, ... }
+
+      Variant C (list-wrapped):
+        { "data": [ { "availabelBalance": 12345.0 } ] }
+
+    Tries all three patterns; falls back to printing every key
+    so the actual balance is never hidden behind 'check app'.
+    """
+    # Both spellings Dhan has used historically
+    BALANCE_KEYS = (
+        "availabelBalance",   # Dhan's consistent misspelling
+        "availableBalance",   # correct spelling (used in some SDK versions)
+        "net",
+        "sodLimit",
+    )
+
+    inner = data
+
+    # Unwrap 'data' if present
+    if "data" in data:
+        inner = data["data"]
+        # If data is a non-empty list, take the first element
+        if isinstance(inner, list) and inner:
+            inner = inner[0]
+
+    if isinstance(inner, dict):
+        for key in BALANCE_KEYS:
+            val = inner.get(key)
+            if val is not None:
+                return str(val)
+        # None of the known keys matched — show all keys so it’s easy to debug
+        pairs = ", ".join(f"{k}={v}" for k, v in inner.items())
+        return f"(raw) {pairs}"
+
+    # Fallback: show the whole payload
+    return f"(raw) {data}"
 
 
 def verify_token(token: str, client_id: str) -> tuple:
@@ -52,7 +105,6 @@ def verify_token(token: str, client_id: str) -> tuple:
     }
 
     try:
-        # Correct Dhan v2 endpoint
         resp = requests.get(
             "https://api.dhan.co/v2/fundlimit",
             headers=headers,
@@ -62,12 +114,7 @@ def verify_token(token: str, client_id: str) -> tuple:
         if resp.status_code == 200:
             try:
                 data      = resp.json()
-                available = (
-                    data.get("data", {}).get("availabelBalance")
-                    or data.get("availabelBalance")
-                    or data.get("availableBalance")
-                    or "check app"
-                )
+                available = _extract_balance(data)
                 return True, f"Token valid — available balance: Rs.{available}"
             except Exception:
                 return True, "Token valid (connected to Dhan)"
