@@ -1,10 +1,19 @@
 # ============================================================
 # signal_engine.py — dhan_xgb_bot_v2
 # Audit-patched 2026-06-28
-# Fix I7: CSV header now checked at write time via _needs_header()
-#         Prevents headerless scan-log rows if file deleted mid-session
-# BUY signal generator with Redis feature/prediction caching,
-# cooldown enforcement, circuit-breaker, and duplicate-order guard
+# Fix I7:  CSV header now checked at write time via _needs_header()
+# Fix FIX-15 (2026-07-06):
+#   - SymbolPenalty integrated: hard-skip penalised symbols, soft
+#     size reduction for symbols with 1–2 recent losses.
+#   - Extension guard: reject if price > MAX_EXTENSION_PCT above EMA20
+#     (prevents chasing late breakouts — primary cause of SL cascade).
+#   - Adaptive breakout confirm: REQUIRE_BREAKOUT_CONFIRMATION is only
+#     a hard gate in SIDEWAYS/WEAK regimes or when price is extended.
+#     In BULL regime with clean price action it becomes a +0.02 prob bonus.
+#   - REQUIRE_VWAP_CONFIRM becomes a soft VWAP_SOFT_PENALTY (prob deduction)
+#     rather than a hard reject, preserving entries in strong-trend names.
+#   - qty_factor key added to BUY result dict so trade_manager can
+#     apply SymbolPenalty.penalty_factor() to position sizing.
 # ============================================================
 
 import pickle, logging, os, json, hashlib
@@ -16,6 +25,20 @@ from features import build_features, FEATURE_COLS
 import config as cfg
 
 log = logging.getLogger("signal_engine")
+
+# ── Lazy module-level SymbolPenalty (shared across all signal calls) ─
+_PENALTY = None
+
+def _get_penalty():
+    global _PENALTY
+    if _PENALTY is None:
+        try:
+            from bot.symbol_penalty import SymbolPenalty
+            _PENALTY = SymbolPenalty()
+        except Exception as e:
+            log.warning("[SymbolPenalty] Could not initialise: %s", e)
+    return _PENALTY
+
 
 # ── Redis helper (lazy import — never crashes if Redis is down) ──
 def _get_redis():
@@ -86,16 +109,11 @@ class SignalEngine:
         self.features = FEATURE_COLS
         self._load_model()
         os.makedirs(os.path.dirname(cfg.SIGNAL_LOG_PATH), exist_ok=True)
-        # FIX I7: removed self._hdr = os.path.exists(...) — stale state bug
-        # Header is now checked at write time via _needs_header()
+        # FIX I7: header checked at write time via _needs_header()
 
     # ── CSV header helper ────────────────────────────────────────────
     @staticmethod
     def _needs_header(path: str) -> bool:
-        """
-        FIX I7: Check file size at write time — not at init.
-        Returns True if the file does not exist or is empty (header needed).
-        """
         try:
             return not os.path.exists(path) or os.path.getsize(path) == 0
         except OSError:
@@ -119,7 +137,8 @@ class SignalEngine:
                    nifty_regime="BULL", nifty_ret_5c=0.0):
 
         result = {"action": "HOLD", "prob": 0.0, "entry": 0.0,
-                  "sl": 0.0, "target": 0.0, "reject_reason": None, "atr": 0.0}
+                  "sl": 0.0, "target": 0.0, "reject_reason": None,
+                  "atr": 0.0, "qty_factor": 1.0}
         now = datetime.now().time()
 
         def reject(reason):
@@ -165,6 +184,11 @@ class SignalEngine:
         cb_key = "bot:circuit_breaker"
         if _safe_exists(cb_key):
             return reject("CIRCUIT_BREAKER_OPEN")
+
+        # ── FIX-15: Symbol penalty gate ────────────────────────
+        penalty = _get_penalty()
+        if penalty is not None and penalty.is_penalised(symbol):
+            return reject(f"SYMBOL_PENALISED")
 
         # ── Duplicate order guard (Redis) ──────────────────────
         dedup_key = f"bot:dedup:{symbol}:{datetime.now().strftime('%Y%m%d%H%M')}"
@@ -220,17 +244,12 @@ class SignalEngine:
 
         result["prob"] = prob
 
-        # ── Threshold gate ─────────────────────────────────────
-        thr = cfg.BUY_THRESHOLD_WEAK if nifty_regime == "WEAK" else cfg.BUY_THRESHOLD_DEFAULT
-        if prob < thr:
-            return reject(f"LOW_PROB({prob:.3f})")
-
         # ── Volume filter ──────────────────────────────────────
         vol_ratio = feat.iloc[0].get("vol_ratio", 1.0)
         if vol_ratio < cfg.MIN_VOLUME_RATIO:
             return reject(f"LOW_VOL({vol_ratio:.2f})")
 
-        # ── ATR SL/TP (Redis ATR cache) ────────────────────────
+        # ── ATR / price ────────────────────────────────────────
         price = df["close"].iloc[-1]
         atr_key = f"bot:atr:{symbol}"
         cached_atr = _safe_get(atr_key)
@@ -239,8 +258,55 @@ class SignalEngine:
         else:
             atr = float(feat.iloc[0].get("atr14", price * 0.005))
             _safe_set(atr_key, str(atr), cfg.TTL_ATR)
+        atr = max(atr, price * 0.005)
 
-        atr    = max(atr, price * 0.005)
+        # ── FIX-15: Extension guard ────────────────────────────
+        # Reject late-breakout entries where price is already extended
+        # above EMA20 by more than MAX_EXTENSION_PCT.
+        # This was the #1 cause of immediate SL hits in the logs.
+        max_ext = getattr(cfg, "MAX_EXTENSION_PCT", 0.025)
+        try:
+            ema20 = df["close"].ewm(span=20, adjust=False).mean().iloc[-1]
+            ext_pct = (price - ema20) / ema20 if ema20 > 0 else 0.0
+            is_extended = ext_pct > max_ext
+        except Exception:
+            ema20 = price
+            ext_pct = 0.0
+            is_extended = False
+
+        if is_extended:
+            return reject(f"EXTENDED({ext_pct:.3f}>{max_ext})")
+
+        # ── FIX-15: Adaptive breakout confirmation ─────────────
+        # Hard gate only in SIDEWAYS/WEAK or when price is near extension.
+        # In BULL regime with clean price action: give a small prob bonus.
+        breakout_ok = feat.iloc[0].get("breakout_confirm", 1)
+        if cfg.REQUIRE_BREAKOUT_CONFIRMATION:
+            if nifty_regime in ("SIDEWAYS", "WEAK", "NEUTRAL") or ext_pct > max_ext * 0.6:
+                if not breakout_ok:
+                    return reject("NO_BREAKOUT_CONFIRM")
+            else:
+                # BULL regime + price not extended: treat as soft bonus
+                if breakout_ok:
+                    prob = min(prob + 0.02, 0.99)
+
+        # ── FIX-15: VWAP soft penalty (not hard reject) ────────
+        # If VWAP confirm is missing, deduct VWAP_SOFT_PENALTY from prob.
+        # This preserves strong-trend entries while reducing overconfidence.
+        vwap_soft_penalty = getattr(cfg, "VWAP_SOFT_PENALTY", 0.04)
+        if cfg.REQUIRE_VWAP_CONFIRM:
+            vwap_above = feat.iloc[0].get("price_above_vwap", 1)
+            if not vwap_above:
+                prob = max(prob - vwap_soft_penalty, 0.0)
+                log.debug("[VWAP] %s below VWAP — prob reduced by %.2f to %.4f",
+                          symbol, vwap_soft_penalty, prob)
+
+        # ── Threshold gate ─────────────────────────────────────
+        thr = cfg.BUY_THRESHOLD_WEAK if nifty_regime == "WEAK" else cfg.BUY_THRESHOLD_DEFAULT
+        if prob < thr:
+            return reject(f"LOW_PROB({prob:.3f})")
+
+        # ── SL / TP / RR ───────────────────────────────────────
         sl     = max(price - cfg.ATR_SL_MULT * atr, price * (1 - cfg.MAX_SL_PCT))
         sl     = min(sl, price * (1 - cfg.MIN_SL_PCT))
         target = price + cfg.ATR_TP_MULT * atr
@@ -248,6 +314,14 @@ class SignalEngine:
 
         if rr < cfg.MIN_RR_RATIO:
             return reject(f"LOW_RR({rr:.2f})")
+
+        # ── FIX-15: qty_factor from symbol penalty ─────────────
+        qty_factor = 1.0
+        if penalty is not None:
+            qty_factor = penalty.penalty_factor(symbol)
+        # qty_factor == 0.0 means penalised — already caught above.
+        # Values 0.25–0.75 mean partial reduction.
+        result["qty_factor"] = round(qty_factor, 2)
 
         # ── Mark duplicate guard (atomic NX) ───────────────────
         _safe_setex_nx(dedup_key, cfg.TTL_DEDUP_ORDER, "1")
@@ -264,7 +338,7 @@ class SignalEngine:
         self._log(symbol, result)
         log.info(
             f"BUY {symbol} entry={price:.2f} sl={sl:.2f} tp={target:.2f} "
-            f"prob={prob:.4f} rr={rr:.2f}"
+            f"prob={prob:.4f} rr={rr:.2f} qty_factor={qty_factor:.2f}"
         )
         return result
 
@@ -302,8 +376,8 @@ class SignalEngine:
             "sl":            result["sl"],
             "target":        result["target"],
             "reject_reason": result.get("reject_reason", ""),
+            "qty_factor":    result.get("qty_factor", 1.0),
         }
-        # FIX I7: check header at write time, not at init
         write_header = self._needs_header(cfg.SIGNAL_LOG_PATH)
         pd.DataFrame([row]).to_csv(
             cfg.SIGNAL_LOG_PATH, mode="a",

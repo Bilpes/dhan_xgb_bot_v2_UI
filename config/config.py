@@ -28,6 +28,9 @@
 #   2026-06-29: Added MAX_OPEN_TRADES — was missing, caused
 #               ImportError in live_bot.py. Full import audit done;
 #               no further missing constants.
+#   2026-07-06: FIX-15 — added extension guard + penalty params.
+#               REQUIRE_BREAKOUT_CONFIRMATION and REQUIRE_VWAP_CONFIRM
+#               are now context-aware (see signal_engine.py FIX-15).
 # ============================================================
 
 import os
@@ -38,14 +41,6 @@ from dotenv import load_dotenv
 
 # ── Bulletproof .env loader ──────────────────────────────────
 def _find_and_load_env() -> bool:
-    """
-    Try loading .env from 4 candidate locations.
-    Priority:
-        1. config/.env  (relative to this file — canonical)
-        2. ../.env      (project root, one level above config/)
-        3. cwd/config/.env
-        4. cwd/.env     (last resort)
-    """
     _this_dir = Path(__file__).resolve().parent
     _project  = _this_dir.parent
     _cwd      = Path.cwd()
@@ -86,12 +81,10 @@ TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 # ── Capital & position sizing ────────────────────────────────
 CAPITAL               = 400_000     # Total trading capital in INR
 MAX_RISK_PCT          = 0.01        # 1% of capital max risk per trade = ₹4,000
-MAX_CAPITAL_PER_TRADE = 0.25        # 25% of capital max per single position = ₹1,00,000
+MAX_CAPITAL_PER_TRADE = 0.25        # 25% of capital max per single position
 MAX_PER_SECTOR        = 2           # Max concurrent positions per sector
-MAX_OPEN_TRADES       = 4           # Max concurrent open positions across all sectors
-                                    # Rationale: 4 × MAX_RISK_PCT = DAILY_LOSS_LIMIT exactly
+MAX_OPEN_TRADES       = 4           # Max concurrent open positions
 DAILY_LOSS_LIMIT      = 0.04        # 4% of CAPITAL = ₹16,000 daily circuit breaker
-                                    # Warning fires at 75% = 3% (see risk_manager SYNC-3)
 
 
 # ── Trade mode ──────────────────────────────────────────────
@@ -117,9 +110,36 @@ MIN_ATR_PCT                  = 0.0007
 MIN_CANDLE_BODY_PCT          = 0.0005
 MAX_DISTANCE_FROM_EMA20      = 0.06
 MAX_DISTANCE_FROM_VWAP       = 0.05
-REQUIRE_BREAKOUT_CONFIRMATION= False
-REQUIRE_VWAP_CONFIRM         = False
+
+# Context-aware confirmation flags (FIX-15)
+# REQUIRE_BREAKOUT_CONFIRMATION: hard gate only in SIDEWAYS/WEAK regimes
+#   or when price is already 60%+ of MAX_EXTENSION_PCT above EMA20.
+#   In BULL regime with clean price: gives +0.02 prob bonus instead.
+REQUIRE_BREAKOUT_CONFIRMATION= True
+
+# REQUIRE_VWAP_CONFIRM: now a soft penalty (deducts VWAP_SOFT_PENALTY
+#   from prob) rather than a hard reject. Strong-trend names not blocked.
+REQUIRE_VWAP_CONFIRM         = True
+
 TREND_STRENGTH_ENABLED       = True
+
+# FIX-15: Extension guard — reject entries where price is already
+# more than this % above the 20-period EMA. Primary fix for the
+# cascade of immediate SL hits observed in 29-Jun – 3-Jul logs.
+MAX_EXTENSION_PCT            = 0.025   # 2.5% above EMA20
+
+# FIX-15: VWAP soft penalty — prob deduction when price is below VWAP
+# and REQUIRE_VWAP_CONFIRM is True. Replaces hard-reject behaviour.
+VWAP_SOFT_PENALTY            = 0.04
+
+
+# ── Symbol penalty (FIX-15) ─────────────────────────────────
+# Track last PENALTY_LOOKBACK trades per symbol.
+# If all N are losses AND cumulative loss > PENALTY_MIN_LOSS (INR),
+# the symbol is skipped for the rest of the session.
+# penalty_factor() reduces qty for 1–2 recent losses (soft mode).
+PENALTY_LOOKBACK             = 3       # rolling window of recent trades
+PENALTY_MIN_LOSS             = 1200    # INR — threshold for full penalty
 
 
 # ── Re-entry protection ─────────────────────────────────────
@@ -150,19 +170,6 @@ _WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")
 
 
 def _load_watchlist():
-    """
-    Build WATCHLIST as {symbol: security_id} from watchlist.json.
-
-    watchlist.json structure:
-        tier_a       : ["ICICIBANK", ...]
-        tier_b       : ["HDFCBANK", ...]
-        SECURITY_IDS : {"ICICIBANK": "4963", ...}
-        SECTOR_MAP   : {"ICICIBANK": "BANKING", ...}
-
-    Returns:
-        WATCHLIST   : dict {symbol: security_id_str}
-        SECTOR_MAP  : dict {symbol: sector_str}
-    """
     if not os.path.exists(_WATCHLIST_FILE):
         print(
             "\n[CONFIG WARNING] config/watchlist.json not found.\n"
@@ -176,13 +183,11 @@ def _load_watchlist():
     sec_ids    = data.get("SECURITY_IDS", {})
     sector_map = data.get("SECTOR_MAP",   {})
 
-    # Combine tier_a + tier_b into active universe
     tier_a  = data.get("tier_a", [])
     tier_b  = data.get("tier_b", [])
     symbols = tier_a + tier_b
 
     if not symbols:
-        # Fallback: if old-style WATCHLIST key exists, use it directly
         old_style = data.get("WATCHLIST", {})
         if old_style:
             print("[config] Using legacy WATCHLIST key from watchlist.json")
@@ -190,7 +195,6 @@ def _load_watchlist():
         print("[CONFIG WARNING] watchlist.json has no tier_a/tier_b/WATCHLIST keys.")
         return {}, sector_map
 
-    # Build {symbol: security_id}
     watchlist = {}
     missing   = []
     for sym in symbols:
