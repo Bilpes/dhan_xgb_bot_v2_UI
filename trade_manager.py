@@ -27,6 +27,10 @@ ISSUE-18: enter() public alias added for enter_trade() — bot.py calls
 ISSUE-19: Position.entry_price property alias — bot.py EOD fallback accesses
           pos.entry_price; field is named `entry`.
 ISSUE-20: _get_sector() now uses wm.get_sector() correctly after WM patch.
+FIX-15:   SymbolPenalty.set_result() wired into exit_trade() so that every
+          trade outcome is recorded in the rolling loss tracker introduced
+          in bot/symbol_penalty.py. Uses lazy _get_penalty() import to
+          avoid circular-import risk.
 
 All thresholds imported from config.py — no magic numbers here.
 """
@@ -307,6 +311,17 @@ class TradeManager:
 
         self._realised_pnl += pnl
         self._check_daily_cb()
+
+        # FIX-15: Feed trade outcome into SymbolPenalty rolling tracker.
+        # Lazy import via _get_penalty() avoids circular-import risk.
+        # Silently skipped if signal_engine is unavailable.
+        try:
+            from signal_engine import _get_penalty
+            p = _get_penalty()
+            if p:
+                p.set_result(symbol, pnl)
+        except Exception as _pen_exc:
+            log.debug("[TradeManager] SymbolPenalty.set_result skipped: %s", _pen_exc)
 
         # ISSUE-13 FIX: notify WatchlistManager of trade result
         if self._wm is not None:
