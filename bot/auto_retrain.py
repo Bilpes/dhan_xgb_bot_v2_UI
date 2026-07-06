@@ -30,6 +30,29 @@
 #               an exception — CSV fallback was never triggered.
 #               Now: broker empty → immediately try CSV,
 #               only skip symbol if BOTH sources are empty.
+#
+#   2026-07-06: THREE bugs causing all 21 symbols to be skipped:
+#
+#     Bug 1 — Datetime timezone mismatch crash:
+#       yfinance CSVs write a tz-aware datetime index (UTC+05:30).
+#       cutoff = datetime.now() is tz-naive. Comparing them raises:
+#         "Invalid comparison between dtype=datetime64[us, UTC+05:30]
+#          and datetime"
+#       Fix: strip tz from the csv datetime column (convert to
+#       naive local time) BEFORE applying the cutoff filter.
+#       cutoff is kept tz-naive throughout.
+#
+#     Bug 2 — CSV silently discarded after crash:
+#       _load_csv_for_symbol() caught the crash, logged a warning,
+#       and returned None — so the file looked absent even though
+#       4216 rows existed on disk. Fixed by Bug 1 resolution above.
+#
+#     Bug 3 — Dhan HTTP 401 blocks CSV fallback:
+#       DhanBroker.get_candles() raises RuntimeError on 401 (by
+#       design for the live path). auto_retrain is offline batch
+#       work — ANY broker failure should immediately try CSV.
+#       Fix: catch ALL exceptions from the broker call, not just
+#       empty-response, so CSV fallback is always reached.
 # ============================================================
 
 from __future__ import annotations
@@ -39,7 +62,7 @@ import os
 import pickle
 import shutil
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -77,17 +100,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("auto_retrain")
 
-# ── Rolling retraining window ─────────────────────────────────
+# ── Rolling retraining window ──────────────────────────────
 RETRAIN_DAYS = int(os.getenv("RETRAIN_DAYS", "90"))
 N_SPLITS     = int(os.getenv("N_SPLITS",     "5"))
 
-# ── Deployment gate ───────────────────────────────────────────
+# ── Deployment gate ──────────────────────────────────
 MIN_ACC  = 0.53
 MIN_AUC  = 0.55
 MIN_PREC = 0.50
 MIN_ROWS = 500
 
-# ── XGBoost params ─────────────────────────────────────────────
+# ── XGBoost params ─────────────────────────────────────
 PARAMS = dict(
     objective          = "binary:logistic",
     eval_metric        = "logloss",
@@ -108,12 +131,30 @@ PARAMS = dict(
 )
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 #  Data loading  (broker-first, CSV fallback)
-#  FIX: Dhan returns empty list silently on weekends/holidays.
-#       Previously this was only caught if broker raised an exception.
-#       Now: empty broker response → immediately try CSV fallback.
-# ──────────────────────────────────────────────────────────────
+#
+#  FIX 2026-07-06:
+#   Bug 1+2: yfinance CSVs have tz-aware datetime (UTC+05:30).
+#     Comparing against tz-naive cutoff crashes with
+#     "Invalid comparison between dtype=datetime64[us, UTC+05:30]
+#      and datetime". Now strips tz before applying cutoff filter.
+#   Bug 3: Dhan 401 raises an exception in DhanBroker.get_candles().
+#     Previous code only handled empty-response; exceptions bypassed
+#     the CSV fallback. Now ALL broker exceptions fall through to CSV.
+# ─────────────────────────────────────────────────────────────
+def _strip_tz(dt_series: pd.Series) -> pd.Series:
+    """
+    Strip timezone info from a datetime Series so it can be
+    compared against tz-naive cutoff datetimes.
+    yfinance writes tz-aware datetimes (e.g. UTC+05:30);
+    we convert to local time and then remove the tz label.
+    """
+    if pd.api.types.is_datetime64tz_dtype(dt_series):
+        return dt_series.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    return dt_series
+
+
 def _load_csv_for_symbol(
     symbol: str,
     hist_dir: Path,
@@ -122,7 +163,10 @@ def _load_csv_for_symbol(
     """
     Load historical CSV for a symbol.
     Searches both data/historical/ and data/ folders.
-    Returns filtered DataFrame or None if not found.
+    Returns filtered DataFrame or None if not found / unreadable.
+
+    FIX 2026-07-06: strip timezone from datetime column before
+    applying cutoff filter to avoid tz-naive vs tz-aware crash.
     """
     candidates = [
         hist_dir / f"{symbol}_5min.csv",               # data/historical/SYMBOL_5min.csv
@@ -134,7 +178,13 @@ def _load_csv_for_symbol(
         if path.exists():
             try:
                 df = pd.read_csv(path, parse_dates=["datetime"])
+                # FIX: strip tz so comparison with tz-naive cutoff works
+                df["datetime"] = _strip_tz(df["datetime"])
                 df = df[df["datetime"] >= cutoff].copy()
+                if df.empty:
+                    log.warning("  %s: CSV found but no rows after cutoff (%s)",
+                                symbol, cutoff.date())
+                    continue
                 df["symbol"] = symbol
                 return df
             except Exception as e:
@@ -145,17 +195,22 @@ def _load_csv_for_symbol(
 def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Fetch last RETRAIN_DAYS of 5-min OHLCV for all watchlist stocks + Nifty.
+
     Strategy per symbol:
-        1. Try DhanBroker.get_candles()
-        2. If broker returns empty OR raises  → try CSV fallback
-        3. If both fail  → skip symbol with warning
-    This handles weekends, NSE holidays, and API outages transparently.
+        1. Try DhanBroker.get_candles()  (live broker data)
+        2. If broker raises ANY exception OR returns empty data
+           → try CSV fallback  (handles 401, weekend, holiday)
+        3. If both fail → skip symbol with warning
+
+    auto_retrain is OFFLINE batch work — the live-path 401 guard
+    in DhanBroker is irrelevant here.  We want maximum data
+    availability, so ANY broker failure falls through to CSV.
     """
     from bot.dhan_api import DhanBroker
     broker   = DhanBroker()
     hist_dir = ROOT / "data" / "historical"
     nifty_path = ROOT / "data" / "raw" / "NIFTY50.csv"
-    cutoff   = datetime.now() - timedelta(days=RETRAIN_DAYS)
+    cutoff   = datetime.now() - timedelta(days=RETRAIN_DAYS)   # tz-naive IST
     frames: list[pd.DataFrame] = []
 
     log.info("[Retrain] Starting — symbols=%d embargo=%dd folds=%d",
@@ -165,31 +220,35 @@ def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
     for symbol, sec_id in WATCHLIST.items():
         df_broker = pd.DataFrame()
 
-        # ─ Step 1: Try broker ───────────────────────────────────
+        # ─ Step 1: Try broker ────────────────────────────────────
+        # FIX Bug 3: catch ALL exceptions (including 401 RuntimeError)
+        # so we always fall through to CSV for offline batch work.
         try:
             df_broker = broker.get_candles(sec_id, symbol, days_back=RETRAIN_DAYS)
             if not df_broker.empty:
                 if "datetime" not in df_broker.columns:
                     df_broker = df_broker.reset_index().rename(
                         columns={"index": "datetime"})
+                df_broker["datetime"] = _strip_tz(df_broker["datetime"])
                 df_broker = df_broker[
                     df_broker["datetime"] >= cutoff].copy()
                 df_broker["symbol"] = symbol
         except Exception as e:
-            log.debug("  %s: broker exception: %s", symbol, e)
+            # 401 / timeout / weekend — all treated the same: try CSV
+            log.debug("  %s: broker unavailable (%s) — trying CSV", symbol, e)
             df_broker = pd.DataFrame()
 
-        # ─ Step 2: Use broker data if non-empty ───────────────────
+        # ─ Step 2: Use broker data if non-empty ──────────────────
         if not df_broker.empty:
             frames.append(df_broker)
             log.info("  broker ✅  %-14s  %d candles", symbol, len(df_broker))
             continue
 
-        # ─ Step 3: Broker empty/failed → try CSV ─────────────────
+        # ─ Step 3: Broker empty/failed → try CSV ────────────────
         df_csv = _load_csv_for_symbol(symbol, hist_dir, cutoff)
         if df_csv is not None and not df_csv.empty:
             frames.append(df_csv)
-            log.info("  csv    📂  %-14s  %d candles (broker empty/offline)",
+            log.info("  csv    📂  %-14s  %d candles (broker unavailable)",
                      symbol, len(df_csv))
             continue
 
@@ -206,7 +265,7 @@ def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     stock_df = pd.concat(frames, ignore_index=True)
 
-    # ── Nifty index ───────────────────────────────────────────────
+    # ── Nifty index ─────────────────────────────────────────────
     nifty_df = pd.DataFrame()
     try:
         nd = broker.get_candles(
@@ -214,15 +273,20 @@ def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
         if not nd.empty:
             if "datetime" not in nd.columns:
                 nd = nd.reset_index().rename(columns={"index": "datetime"})
+            nd["datetime"] = _strip_tz(nd["datetime"])
             nifty_df = nd[nd["datetime"] >= cutoff].copy()
             log.info("  Nifty  ✅  broker  %d candles", len(nifty_df))
     except Exception as e:
         log.debug("Nifty broker exception: %s", e)
 
     if nifty_df.empty and nifty_path.exists():
-        nifty_df = pd.read_csv(nifty_path, parse_dates=["datetime"])
-        nifty_df = nifty_df[nifty_df["datetime"] >= cutoff].copy()
-        log.info("  Nifty  📂  CSV  %d candles", len(nifty_df))
+        try:
+            nifty_df = pd.read_csv(nifty_path, parse_dates=["datetime"])
+            nifty_df["datetime"] = _strip_tz(nifty_df["datetime"])
+            nifty_df = nifty_df[nifty_df["datetime"] >= cutoff].copy()
+            log.info("  Nifty  📂  CSV  %d candles", len(nifty_df))
+        except Exception as e:
+            log.warning("  Nifty CSV read error: %s", e)
 
     if nifty_df.empty:
         log.warning("  Nifty unavailable — index features will be 0.")
@@ -230,9 +294,9 @@ def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
     return stock_df, nifty_df
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 #  ATR path-dependent label
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def _make_atr_labels(feat: pd.DataFrame) -> pd.DataFrame:
     """
     Label = 1 (BUY) if TP hit before SL within HORIZON bars.
@@ -266,9 +330,9 @@ def _make_atr_labels(feat: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(groups, ignore_index=True)
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 #  Walk-forward OOS evaluation
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def _walk_forward(X: np.ndarray, y: np.ndarray) -> dict:
     tscv = TimeSeriesSplit(n_splits=N_SPLITS)
     accs, aucs, precs, recalls = [], [], [], []
@@ -302,9 +366,9 @@ def _walk_forward(X: np.ndarray, y: np.ndarray) -> dict:
     }
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 #  Train final model on full data
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def _train_final(X: np.ndarray, y: np.ndarray) -> tuple:
     split       = int(len(X) * 0.85)
     X_tr, X_val = X[:split], X[split:]
@@ -323,9 +387,9 @@ def _train_final(X: np.ndarray, y: np.ndarray) -> tuple:
     return model, scaler
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 #  Deployment gate
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def _gate_passes(metrics: dict, n: int) -> bool:
     checks = {
         f"acc  {metrics['acc']:.3f}  >= {MIN_ACC}":  metrics["acc"]  >= MIN_ACC,
@@ -342,9 +406,9 @@ def _gate_passes(metrics: dict, n: int) -> bool:
     return all_pass
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 #  Telegram helper
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def _notify(msg: str):
     try:
         from bot.telegram_alert import _send
@@ -353,9 +417,9 @@ def _notify(msg: str):
         log.warning("Telegram notify failed: %s", e)
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 #  Main entry point
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def retrain():
     log.info("=" * 58)
     log.info("  AUTO-RETRAIN  %s", datetime.now().strftime("%Y-%m-%d %H:%M IST"))
