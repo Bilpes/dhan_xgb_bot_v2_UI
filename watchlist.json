@@ -1,31 +1,30 @@
 {
-  "_comment": "Curated 21-stock universe — last updated 2026-06-29. Do NOT add stocks without checking: daily vol > 300Cr, MCap > 15000Cr, no news-event driven names, no Adani group.",
+  "_comment": "20-stock curated intraday universe v4.0 — 2026-07-17. Updated: removed IT sector (TCS/INFY), added Federal Bank, Aarti Industries. Adani Ports retained. Starts trading 9:15.",
 
   "tier_a": [
+    "HDFCBANK",
     "ICICIBANK",
     "SBIN",
     "AXISBANK",
-    "KOTAKBANK",
-    "BAJFINANCE",
+    "FEDERALBNK",
     "RELIANCE",
-    "SUNPHARMA",
+    "BAJFINANCE",
     "LT",
-    "HAL",
-    "BEL",
-    "TITAN",
-    "CHOLAFIN"
+    "ADANIPORTS",
+    "KOTAKBANK"
   ],
 
   "tier_b": [
-    "HDFCBANK",
-    "DRREDDY",
-    "CIPLA",
-    "EICHERMOT",
-    "TRENT",
-    "ETERNAL",
-    "ADANIPORTS",
-    "CGPOWER",
-    "HAVELLS"
+    "AARTIIND",
+    "SUNPHARMA",
+    "HAL",
+    "BEL",
+    "TITAN",
+    "COALINDIA",
+    "HINDZINC",
+    "NTPC",
+    "CHOLAFIN",
+    "TATAMOTORS"
   ],
 
   "SECURITY_IDS": {
@@ -34,22 +33,21 @@
     "SBIN":       "3045",
     "AXISBANK":   "5900",
     "KOTAKBANK":  "1922",
+    "FEDERALBNK": "1023",
     "BAJFINANCE": "317",
     "RELIANCE":   "2885",
-    "EICHERMOT":  "910",
-    "SUNPHARMA":  "3351",
-    "DRREDDY":    "881",
-    "CIPLA":      "694",
+    "ADANIPORTS": "15083",
     "LT":         "11483",
+    "AARTIIND":   "7",
+    "SUNPHARMA":  "3351",
     "HAL":        "541154",
     "BEL":        "383",
     "TITAN":      "3506",
-    "TRENT":      "1951",
-    "ETERNAL":    "6383572",
-    "ADANIPORTS": "15083",
+    "COALINDIA":  "1333",
+    "HINDZINC":   "756",
+    "NTPC":       "11630",
     "CHOLAFIN":   "1020",
-    "CGPOWER":    "534",
-    "HAVELLS":    "6191"
+    "TATAMOTORS": "3456"
   },
 
   "SECTOR_MAP": {
@@ -58,61 +56,49 @@
     "SBIN":       "BANKING",
     "AXISBANK":   "BANKING",
     "KOTAKBANK":  "BANKING",
+    "FEDERALBNK": "BANKING",
     "BAJFINANCE": "FINANCE",
     "CHOLAFIN":   "FINANCE",
     "RELIANCE":   "ENERGY",
-    "EICHERMOT":  "AUTO",
-    "SUNPHARMA":  "PHARMA",
-    "DRREDDY":    "PHARMA",
-    "CIPLA":      "PHARMA",
+    "NTPC":       "ENERGY",
     "LT":         "INFRA",
-    "CGPOWER":    "INFRA",
-    "HAVELLS":    "INFRA",
+    "ADANIPORTS": "PORTS",
+    "SUNPHARMA":  "PHARMA",
     "HAL":        "DEFENCE",
     "BEL":        "DEFENCE",
     "TITAN":      "CONSUMER",
-    "TRENT":      "CONSUMER",
-    "ETERNAL":    "CONSUMER",
-    "ADANIPORTS": "PORTS"
-  },
-
-  "ALT_USED": {
-    "TATAMOTORS": "TMCV",
-    "LTIM":       "LTM"
+    "TATAMOTORS": "AUTO",
+    "COALINDIA":  "METALS",
+    "HINDZINC":   "METALS",
+    "AARTIIND":   "CHEMICALS"
   },
 
   "BLOCKED_SYMBOLS": [
     "YESBANK", "IDEA", "RBLBANK", "PAYTM", "BANKBARODA",
-    "SAIL", "BHEL", "RAILVIKAS", "IPCALAB", "KALYANKJIL",
-    "DELHIVERY", "ADANIENT", "ADANIPOWER", "ADANIENERGY",
-    "PIDILITIND", "HINDCOPPER", "MOIL", "NATIONALUM",
-    "SJVN", "NHPC", "IRCON", "GRSE", "COCHINSHIP",
-    "MAZAGONDOCK", "INDIAMART", "JUBLFOOD", "NYKAA",
-    "INDHOTEL", "OBEROIRLTY", "PHOENIXLTD", "AARTI",
-    "DEEPAKNTR", "PIIND",
+    "SAIL", "BHEL", "RAILVIKAS",
     "TCS", "INFY", "HCLTECH", "WIPRO", "LTIM", "PERSISTENT",
-    "TATASTEEL", "JSWSTEEL", "HINDALCO",
-    "NTPC", "POWERGRID",
-    "BAJAJFINSV", "BHARTIARTL",
-    "TATAMOTORS", "M&M", "MARUTI", "BAJAJ-AUTO"
+    "ADANIENT", "ADANIPOWER", "ADANIENERGY",
+    "TATASTEEL", "JSWSTEEL", "HINDALCO"
   ],
 
   "metadata": {
-    "version": "v3.3",
-    "created": "2026-06-28",
-    "patched": "2026-06-29 — v3.3: reverted bad 38-stock push (v3.2 had TCS/INFY/IT/BLOCKED stocks in active universe). Restored curated 21-stock list. 6 SECURITY_IDS corrected (HAL: 2303→541154, TRENT: 1964→1951, ETERNAL: 5097→6383572, CHOLAFIN: 685→1020, CGPOWER: 760→534, HAVELLS: 9819→6191).",
-    "size": 21,
-    "inclusion_criteria": "daily vol > 300Cr, MCap > 15000Cr, no news-event driven names, no Adani group, no IT heavyweights, no PSU junk",
+    "version": "v4.0",
+    "created": "2026-07-17",
+    "patched": "2026-07-17 — v4.0: Removed IT sector. Added Federal Bank (FEDERALBNK), Aarti Industries (AARTIIND). Added COALINDIA, HINDZINC, NTPC, TATAMOTORS for high-beta intraday range. Adani Ports kept. MAX_PER_SECTOR=3 for BANKING to allow Federal Bank alongside HDFC/ICICI.",
+    "size": 20,
+    "inclusion_criteria": "daily vol > 200Cr, high intraday ATR, no news-event driven names, supports 9:15 ORB plays",
     "sector_composition": {
-      "BANKING":  ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK"],
-      "FINANCE":  ["BAJFINANCE", "CHOLAFIN"],
-      "ENERGY":   ["RELIANCE"],
-      "AUTO":     ["EICHERMOT"],
-      "PHARMA":   ["SUNPHARMA", "DRREDDY", "CIPLA"],
-      "INFRA":    ["LT", "CGPOWER", "HAVELLS"],
-      "DEFENCE":  ["HAL", "BEL"],
-      "CONSUMER": ["TITAN", "TRENT", "ETERNAL"],
-      "PORTS":    ["ADANIPORTS"]
+      "BANKING":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "FEDERALBNK"],
+      "FINANCE":   ["BAJFINANCE", "CHOLAFIN"],
+      "ENERGY":    ["RELIANCE", "NTPC"],
+      "INFRA":     ["LT"],
+      "PORTS":     ["ADANIPORTS"],
+      "PHARMA":    ["SUNPHARMA"],
+      "DEFENCE":   ["HAL", "BEL"],
+      "CONSUMER":  ["TITAN"],
+      "AUTO":      ["TATAMOTORS"],
+      "METALS":    ["COALINDIA", "HINDZINC"],
+      "CHEMICALS": ["AARTIIND"]
     }
   }
 }
