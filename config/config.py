@@ -2,52 +2,36 @@
 #  config/config.py  — Infrastructure, paths, API keys,
 #                        timing, filters, Redis, Telegram.
 #
-#  v4.5 PATCH 2026-07-18  (3 backtest fixes):
+#  v4.6 PATCH 2026-07-19  (4 backtest bug fixes from real data):
 #
-#  FIX-1 [GAP-1]: SIDEWAYS_CONSECUTIVE_SCANS 3 → 2
-#    Fires sideways-day block one scan earlier. Prevents the
-#    3rd entry on Jun-15 / Jun-17 style choppy days that caused
-#    the biggest daily losses in the 30-day backtest.
+#  BUG-1: MAX_TRADES_PER_DAY = 8
+#    Session-level hard stop. Jul-9 had 17 trades at 11.8% win
+#    rate = -₹4,462 because bot re-entered after every SL hit
+#    with no ceiling. 8 trades = 2 full rotations of 4-slot book.
 #
+#  BUG-2: NEUTRAL regime consecutive SL block
+#    18/21 backtest days NEUTRAL, win rate 29.3% — far below
+#    break-even. Block all new entries after 2 consecutive SL
+#    exits on NEUTRAL days. Reset streak on any winning trade.
+#    Also tightened BUY_THRESHOLD_NEUTRAL 0.60 → 0.62.
+#
+#  BUG-3: MAX_DAILY_LOSS 2% → 0.375% (₹8000 → ₹1500)
+#    Jul 6/7/9/15 each bled ₹1500–₹4500 with no circuit breaker
+#    firing. ₹1500 = ~3 max-loss trades = meaningful protection
+#    without triggering on normal intraday swings.
+#
+#  BUG-4: Banking stocks min threshold on NEUTRAL days
+#    SBIN+LT+RELIANCE+AXISBANK = -₹11,800 combined. These 4
+#    high-beta names need score ≥10 (prob ≥ 0.64) on NEUTRAL days
+#    to avoid chasing momentum against the broader market trend.
+#
+#  v4.5 PATCH 2026-07-18  (retained — 3 synthetic backtest fixes):
+#  FIX-1 [GAP-1]: SIDEWAYS_CONSECUTIVE_SCANS 3→2
 #  FIX-2: MAX_TRADES_PER_STOCK_PER_DAY = 3
-#    After 3 closed trades on the same symbol in a session, no
-#    new entry is allowed for that symbol today. Prevents
-#    BAJFINANCE/BEL overtrading (26-31% win-rate stocks that
-#    kept re-entering after losses).
-#
-#  FIX-3: MIN_SIGNAL_SCORE_WEAK = 10  (was 8)
-#    On NEUTRAL or WEAK regime days the signal score must reach
-#    >= 10. BUY_THRESHOLD_WEAK / SELL_THRESHOLD_WEAK tightened
-#    0.58 → 0.60. Expected win-rate lift: 38% → 44%+.
+#  FIX-3: MIN_SIGNAL_SCORE_WEAK = 10
 #
 #  v4.4 PATCH 2026-07-18 (retained):
-#
-#  SIZING INTENT (user):
-#    Paper mode: 4L total capital, 4 open trades = Rs1L per trade slot.
-#    'Don't cap anything' — each trade gets its full slot budget.
-#    On Rs1000 stock: qty = floor(1,00,000 / 1000) = 100 shares.
-#    TP at 1.8x ATR (e.g. Rs9/share) * 100 = Rs900 per winner.
-#    SL at 1.2x ATR (e.g. Rs6/share) * 100 = -Rs600 per loser.
-#
-#  CAPITAL = 4,00,000 (paper mode; 4 slots x Rs1L each)
-#  MAX_CAPITAL_PER_TRADE = 1.00 (NO cap — full slot budget per trade)
-#  Per-slot budget computed as: CAPITAL / MAX_OPEN_POSITIONS
-#
-#  GAP-1: SIDEWAYS_NIFTY_THRESH = 0.003
-#         When abs(nifty_5c_return) < 0.003 AND regime=NEUTRAL for
-#         2 consecutive scans -> treat day as SIDEWAYS, block new entries.
-#
-#  GAP-2: ATR_TP_MULT = 1.8 (was 2.5)
-#         Choppy/range-bound market — price rarely travels 2.5x ATR.
-#         1.8x TP hits more frequently. RR = 1.8/1.2 = 1.5 (valid).
-#
-#  GAP-3: ATR_TP_MULT_BULL = 2.5
-#         On confirmed BULL days, signal_engine dynamically uses 2.5x.
-#         On NEUTRAL/WEAK, uses ATR_TP_MULT (1.8x).
-#
-#  v4.3 changes (2026-07-18) retained:
-#    CAPITAL corrected, MAX_RISK_PCT=0.015, thresholds 0.55/0.60,
-#    NO_REENTRY_MINUTES=30, AVOID_LUNCH_HOURS=True
+#  SIZING REWORK — slot budget Rs1L per trade, no cap.
 # ============================================================
 
 import os
@@ -93,37 +77,28 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 
 
 # ── Capital & position sizing ────────────────────────────────────────
-# Paper mode: 4L total capital, 4 open trade slots = Rs1L per slot.
-# Each slot budget = CAPITAL / MAX_OPEN_POSITIONS = Rs1,00,000.
-# No per-trade cap (MAX_CAPITAL_PER_TRADE = 1.0).
-#
-# Qty sizing on a Rs1000 stock:
-#   slot_budget  = 4,00,000 / 4 = Rs1,00,000
-#   qty          = floor(1,00,000 / 1000) = 100 shares
-#   SL distance  = 1.2 * ATR (e.g. Rs6)  -> risk = 100 * Rs6 = Rs600
-#   TP distance  = 1.8 * ATR (e.g. Rs9)  -> gain = 100 * Rs9 = Rs900
-#   Daily target Rs500 needs ~1 winning trade (Rs900) or 2 moderate ones.
 CAPITAL               = 4_00_000     # Paper: 4L total (4 slots × Rs1L)
 TOTAL_CAPITAL         = CAPITAL
 
 MAX_RISK_PCT          = 0.015        # 1.5% risk — Rs6000 on Rs4L
 RISK_PER_TRADE        = MAX_RISK_PCT
 
-# NO cap: each trade slot uses its full budget (CAPITAL / MAX_OPEN_POSITIONS)
-# compute_qty uses slot_budget = CAPITAL / MAX_OPEN_POSITIONS
-MAX_CAPITAL_PER_TRADE = 1.00        # 100% — no restriction; slot budgeting handles this
+MAX_CAPITAL_PER_TRADE = 1.00        # No cap — slot budgeting handles this
 
-MAX_PER_SECTOR        = 2           # max 2 positions in same sector (was 3)
+MAX_PER_SECTOR        = 2
 MAX_OPEN_TRADES       = 4
 MAX_OPEN_POSITIONS    = MAX_OPEN_TRADES
 
-# Daily loss limit: 2% of Rs4L = Rs8,000 max daily loss (paper)
-DAILY_LOSS_LIMIT      = 0.02
+# ── BUG-3 FIX: Daily loss limit tightened 2% → 0.375% ───────────────
+# Old: 0.02 * 4L = Rs8,000  — too wide, bled Rs4,462 on Jul-9 alone
+# New: 0.00375 * 4L = Rs1,500 — ~3 full-size losing trades
+# Rationale: Rs500 daily target means Rs1,500 loss = -3x target.
+#   At that point the day is statistically unrecoverable.
+DAILY_LOSS_LIMIT      = 0.00375     # BUG-3: was 0.02
 MAX_DAILY_LOSS        = DAILY_LOSS_LIMIT
 
 
 # ── Daily P&L management ─────────────────────────────────────────────
-# Rs500 target per day = 0.125% of Rs4L paper capital.
 DAILY_TARGET          = 500.0
 PROFIT_LOCK_FLOOR     = 500.0
 PROFIT_PULLBACK_RS    = 45.0
@@ -132,34 +107,45 @@ NIFTY_RESISTANCE_MULT    = 1.002
 NIFTY_WEAK_HARD_STOP     = True
 
 
-# ── FIX-1: Sideways day detection ────────────────────────────────────
-# When Nifty 5-candle return < SIDEWAYS_NIFTY_THRESH AND regime stays
-# NEUTRAL for SIDEWAYS_CONSECUTIVE_SCANS scans, declare SIDEWAYS day.
-# No new entries on sideways days — only manage existing positions.
-#
-# CHANGED v4.5: 3 → 2 scans
-# With 3 scans the bot entered a 3rd trade before blocking kicked in
-# on choppy Jun-15 / Jun-17 days. 2 scans fires the block earlier and
-# prevents that 3rd entry entirely.
-SIDEWAYS_NIFTY_THRESH        = 0.003   # 0.3% threshold
-SIDEWAYS_CONSECUTIVE_SCANS   = 2       # FIX-1: was 3, now 2
+# ── BUG-1 FIX: Session-level trade cap ──────────────────────────────
+# Hard ceiling on total trades fired per session (all symbols combined).
+# Jul-9: 17 trades at 11.8% win rate = -₹4,462. No session ceiling meant
+# the bot kept re-entering after every SL hit on choppy NEUTRAL days.
+# 8 = 2 full rotations of the 4-slot book. Beyond 8, day is noise.
+MAX_TRADES_PER_DAY           = 8    # BUG-1: NEW — session hard stop
 
 
-# ── FIX-2: Per-stock per-day trade cap ───────────────────────────────
-# After this many CLOSED trades on a single symbol today, block further
-# entries for that symbol until next session reset.
-#
-# Motivation: BAJFINANCE (31% win-rate) and BEL (26% win-rate) kept
-# re-entering after losses, compounding drawdown. 3 trades = 2 normal
-# attempts + 1 recovery; if all 3 lose, that stock is done for the day.
+# ── FIX-1 (v4.5): Sideways day detection ─────────────────────────────
+SIDEWAYS_NIFTY_THRESH        = 0.003
+SIDEWAYS_CONSECUTIVE_SCANS   = 2    # was 3
+
+
+# ── FIX-2 (v4.5): Per-stock per-day trade cap ────────────────────────
 MAX_TRADES_PER_STOCK_PER_DAY = 3
 
 
-# ── FIX-3: Signal score floor on weak/neutral days ───────────────────
-# Signal score threshold when Nifty regime is NEUTRAL or WEAK.
-# Raised from 8 → 10 to cut noise trades on low-conviction days.
-# Expected win-rate improvement: 38% → 44%+.
-MIN_SIGNAL_SCORE_WEAK        = 10      # FIX-3: was 8
+# ── FIX-3 (v4.5): Signal score floor on weak/neutral days ────────────
+MIN_SIGNAL_SCORE_WEAK        = 10
+
+
+# ── BUG-2 FIX: NEUTRAL regime consecutive SL block ──────────────────
+# After this many consecutive SL exits on a NEUTRAL day, block all new
+# entries for the rest of the session. Reset on any winning trade.
+# 18/21 backtest days were NEUTRAL at only 29.3% win rate.
+NEUTRAL_CONSEC_SL_BLOCK      = 2    # BUG-2: NEW
+
+
+# ── BUG-4 FIX: Banking stocks higher threshold on NEUTRAL days ────────
+# SBIN + LT + RELIANCE + AXISBANK = -₹11,800 combined in 30-day backtest.
+# These high-beta names require stronger conviction on NEUTRAL days:
+#   BUY_THRESHOLD_BANKING_NEUTRAL = 0.64 ≈ signal score ≥ 10
+# Add/remove tickers here without touching signal_engine logic.
+BANKING_STOCKS = [
+    "SBIN", "AXISBANK", "ICICIBANK", "HDFCBANK",
+    "KOTAKBANK", "INDUSINDBK", "BANDHANBNK",
+    "LT", "RELIANCE",          # over-traded high-beta non-banks included
+]
+BUY_THRESHOLD_BANKING_NEUTRAL = 0.64   # BUG-4: NEW — prob ≥ 0.64 on NEUTRAL
 
 
 # ── Trade mode ────────────────────────────────────────────────────────
@@ -198,15 +184,8 @@ MIN_SL_PCT                   = 0.004
 MAX_SL_PCT                   = 0.035
 ATR_SL_MULT                  = 1.2
 
-# GAP-2: TP multiplier — 1.8x for choppy/range market (was 2.5x)
-# RR = 1.8 / 1.2 = 1.5 — exactly meets MIN_RR_RATIO. Valid.
-# More TP hits in sideways-to-mild-trending conditions.
-ATR_TP_MULT                  = 1.8
-
-# GAP-3: BULL day TP multiplier — 2.5x on confirmed trend days
-# signal_engine uses this when regime == "BULL" + nifty_above_resistance
-ATR_TP_MULT_BULL             = 2.5
-
+ATR_TP_MULT                  = 1.8   # choppy/range market
+ATR_TP_MULT_BULL             = 2.5   # confirmed BULL days
 SIDEWAYS_ATR_RATIO           = 0.80
 
 REQUIRE_BREAKOUT_CONFIRMATION= True
@@ -218,9 +197,10 @@ VWAP_SOFT_PENALTY            = 0.03
 
 # ── Signal thresholds ─────────────────────────────────────────────────
 BUY_THRESHOLD_DEFAULT        = 0.55
-BUY_THRESHOLD_WEAK           = 0.60   # FIX-3: was 0.58 — tighter on weak days
+BUY_THRESHOLD_WEAK           = 0.60
+BUY_THRESHOLD_NEUTRAL        = 0.62   # BUG-2: NEW — NEUTRAL needs higher conviction
 SELL_THRESHOLD_DEFAULT       = 0.60
-SELL_THRESHOLD_WEAK          = 0.60   # FIX-3: was 0.58 — aligned with buy
+SELL_THRESHOLD_WEAK          = 0.60
 MIN_RR_RATIO                 = 1.5
 
 
