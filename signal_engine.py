@@ -1,31 +1,19 @@
 # ============================================================
 # signal_engine.py — dhan_xgb_bot_v2
-# v4.3 PATCH 2026-07-18:
-#   FIX-1b: REMOVED daily_target gate from get_signal().
-#            The gate existed in TWO places:
-#              1. signal_engine.get_signal()   ← REMOVED HERE
-#              2. bot._can_enter_new()          ← KEPT (authoritative)
-#            Having it in both places caused a subtle bug: if daily_pnl
-#            was passed as 0.0 (default or stale), signal_engine would
-#            still fire correctly, but if daily_pnl carried over from
-#            a previous day's session (before EOD reset), it would
-#            incorrectly block ALL signals from 9:15 AM on day 2.
-#            Removing it here — bot._can_enter_new() is the single gate.
+# v4.4 PATCH 2026-07-18:
+#   GAP-2/3: get_signal() now accepts tp_mult parameter.
+#     - tp_mult is computed by bot._get_tp_mult() before calling get_signal.
+#     - 1.8x on NEUTRAL/WEAK/SIDEWAYS days (choppy market — hit TP sooner)
+#     - 2.5x on BULL + above resistance days (ride the trend)
+#     - SL/TP in result dict computed with this tp_mult.
+#     - tp_mult stored in result dict so trade_manager can use same value.
 #
-#   FIX-7b: Lunch hour check added inside get_signal() time gate.
-#            Previously AVOID_LUNCH_HOURS was only in bot.scan() which
-#            doesn't always call signal_engine directly. Added here as
-#            a second enforcement layer so no signal fires 12:30-13:00.
+# v4.3 PATCH 2026-07-18 (retained):
+#   FIX-1b: REMOVED daily_target gate (double-gate bug fixed)
+#   FIX-7b: Lunch hour gate added
 #
-# v4.0 Changes 2026-07-17:
-#   - SELL (SHORT) signal added — symmetric to BUY logic
-#   - Per-stock sideways skip: if stock's own ATR < SIDEWAYS_ATR_RATIO
-#     of its 20-period ATR mean, skip — stock is consolidating
-#   - Opening momentum boost: 9:15-9:30 candles get +0.02 prob bonus
-#     if aligned with ORB direction (catches first-candle moves)
-#   - Daily target gate: REMOVED — now handled only in bot._can_enter_new()
-#   - Extension guard: now applied to SELL side too (price too far below EMA)
-#   - All prior fixes (FIX-15, ISSUE-21) retained
+# v4.0 Changes 2026-07-17 (retained):
+#   SELL (SHORT) signal, per-stock sideways skip, opening momentum bonus
 # ============================================================
 
 import pickle, logging, os, json, hashlib
@@ -38,7 +26,7 @@ import config as cfg
 
 log = logging.getLogger("signal_engine")
 
-# ── Lazy SymbolPenalty ───────────────────────────────────────
+# ── Lazy SymbolPenalty ────────────────────────────────────────────────
 _PENALTY = None
 
 def _get_penalty():
@@ -52,7 +40,7 @@ def _get_penalty():
     return _PENALTY
 
 
-# ── Redis helpers ────────────────────────────────────────────
+# ── Redis helpers ─────────────────────────────────────────────────────
 def _get_redis():
     try:
         import redis as _redis
@@ -140,16 +128,22 @@ class SignalEngine:
     def reload_model(self):
         self._load_model()
 
-    # ─────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
     # MAIN SIGNAL: returns BUY, SELL, or HOLD
-    # ─────────────────────────────────────────────────────────
+    # GAP-2/3: tp_mult parameter added — adaptive TP multiplier
+    # ──────────────────────────────────────────────────────────────────
     def get_signal(self, symbol, df, current_positions,
                    nifty_regime="BULL", nifty_ret_5c=0.0,
-                   daily_pnl=0.0):
+                   daily_pnl=0.0, tp_mult: float = None):
+
+        # Default tp_mult from config if not provided
+        if tp_mult is None:
+            tp_mult = getattr(cfg, "ATR_TP_MULT", 1.8)
 
         result = {"action": "HOLD", "prob": 0.0, "entry": 0.0,
                   "sl": 0.0, "target": 0.0, "reject_reason": None,
-                  "atr": 0.0, "qty_factor": 1.0, "side": "LONG"}
+                  "atr": 0.0, "qty_factor": 1.0, "side": "LONG",
+                  "tp_mult": tp_mult}   # pass through to trade_manager
         now = datetime.now().time()
 
         def reject(reason):
@@ -157,22 +151,11 @@ class SignalEngine:
             self._log(symbol, result)
             return result
 
-        # ── FIX-1b: REMOVED daily_target gate from here ──────
-        # The authoritative gate is bot._can_enter_new() which correctly
-        # checks DAILY_TARGET + regime + profit-lock together.
-        # Having the gate here caused:
-        #   1. Double rejection — signal_engine AND bot both checked it
-        #   2. Stale daily_pnl bug — if pnl carried over or wasn't passed,
-        #      ALL signals blocked from 9:15 on day 2
-        # daily_pnl parameter kept in signature for logging/future use.
-
-        # ── Time gate ──────────────────────────────────────────
+        # ── Time gate ──────────────────────────────────────────────────
         if now < cfg.NO_NEW_TRADE_BEFORE or now >= cfg.NO_NEW_TRADE_AFTER:
             return reject("OUTSIDE_HOURS")
 
-        # ── FIX-7b: Lunch hour gate ────────────────────────────
-        # Block signals during lunch (12:30-13:00) if AVOID_LUNCH_HOURS=True.
-        # Low-volume, choppy, mean-reverting — false breakouts eat into P&L.
+        # ── Lunch hour gate (FIX-7b) ───────────────────────────────────
         if getattr(cfg, 'AVOID_LUNCH_HOURS', False):
             from datetime import time as _dtime
             try:
@@ -185,17 +168,17 @@ class SignalEngine:
             except Exception:
                 pass
 
-        # ── Model gate ─────────────────────────────────────────
+        # ── Model gate ─────────────────────────────────────────────────
         if self.model is None:
             return reject("NO_MODEL")
 
-        # ── Data quality ───────────────────────────────────────
-        if len(df) < 50:  # v4: reduced from 210 — allows 9:15 entries
+        # ── Data quality ───────────────────────────────────────────────
+        if len(df) < 50:
             return reject(f"INSUFFICIENT_DATA({len(df)})")
         if df["close"].iloc[-1] < cfg.MIN_STOCK_PRICE:
             return reject(f"PRICE_LOW({df['close'].iloc[-1]:.0f})")
 
-        # ── Position limits ────────────────────────────────────
+        # ── Position limits ────────────────────────────────────────────
         if symbol in current_positions:
             return reject("ALREADY_OPEN")
 
@@ -210,23 +193,23 @@ class SignalEngine:
         if len(current_positions) >= cfg.MAX_OPEN_POSITIONS:
             return reject("MAX_POSITIONS")
 
-        # ── Cooldown / circuit breaker ─────────────────────────
+        # ── Cooldown / circuit breaker ─────────────────────────────────
         if _safe_exists(f"bot:cooldown:{symbol}"):
             return reject("COOLDOWN")
         if _safe_exists("bot:circuit_breaker"):
             return reject("CIRCUIT_BREAKER_OPEN")
 
-        # ── Symbol penalty ─────────────────────────────────────
+        # ── Symbol penalty ─────────────────────────────────────────────
         penalty = _get_penalty()
         if penalty is not None and penalty.is_penalised(symbol):
             return reject("SYMBOL_PENALISED")
 
-        # ── Duplicate guard ────────────────────────────────────
+        # ── Duplicate guard ────────────────────────────────────────────
         dedup_key = f"bot:dedup:{symbol}:{datetime.now().strftime('%Y%m%d%H%M')}"
         if _safe_exists(dedup_key):
             return reject("DUPLICATE_SIGNAL")
 
-        # ── Feature vector ─────────────────────────────────────
+        # ── Feature vector ─────────────────────────────────────────────
         feat_key  = f"bot:feat:{symbol}"
         feat_hash = hashlib.md5(str(df["close"].iloc[-1]).encode()).hexdigest()[:8]
         cached_feat_raw = _safe_get(feat_key + ":val")
@@ -256,7 +239,7 @@ class SignalEngine:
             except Exception as e:
                 return reject(f"FEAT_ERR({e})")
 
-        # ── XGBoost prediction ─────────────────────────────────
+        # ── XGBoost prediction ─────────────────────────────────────────
         pred_key    = f"bot:pred:{symbol}:{feat_hash}"
         cached_prob = _safe_get(pred_key)
         if cached_prob is not None:
@@ -267,21 +250,20 @@ class SignalEngine:
                 X = np.where(np.isfinite(X), X, 0.0)
                 X_sc = self.scaler.transform(X)
                 proba = self.model.predict_proba(X_sc)[0]
-                prob_long = float(proba[1])  # probability of BUY/UP
+                prob_long = float(proba[1])
                 _safe_set(pred_key, str(prob_long), cfg.TTL_PREDICTION)
             except Exception as e:
                 return reject(f"PREDICT_ERR({e})")
 
-        # prob_short = inverse probability (DOWN move)
         prob_short = 1.0 - prob_long
         result["prob"] = prob_long
 
-        # ── Volume filter ──────────────────────────────────────
+        # ── Volume filter ──────────────────────────────────────────────
         vol_ratio = feat.iloc[0].get("vol_ratio", 1.0)
         if vol_ratio < cfg.MIN_VOLUME_RATIO:
             return reject(f"LOW_VOL({vol_ratio:.2f})")
 
-        # ── ATR / price ────────────────────────────────────────
+        # ── ATR / price ────────────────────────────────────────────────
         price = df["close"].iloc[-1]
         atr_key    = f"bot:atr:{symbol}"
         cached_atr = _safe_get(atr_key)
@@ -292,13 +274,13 @@ class SignalEngine:
             _safe_set(atr_key, str(atr), cfg.TTL_ATR)
         atr = max(atr, price * 0.005)
 
-        # ── v4.0: Per-stock sideways skip ──────────────────────
+        # ── Per-stock sideways skip ────────────────────────────────────
         sideways_ratio = getattr(cfg, "SIDEWAYS_ATR_RATIO", 0.80)
         atr_expansion  = float(feat.iloc[0].get("atr_expansion", 1.0))
         if atr_expansion < sideways_ratio:
             return reject(f"STOCK_SIDEWAYS(atr_expansion={atr_expansion:.2f})")
 
-        # ── Extension guard (BUY side) ─────────────────────────
+        # ── Extension guard ────────────────────────────────────────────
         max_ext = getattr(cfg, "MAX_EXTENSION_PCT", 0.030)
         try:
             ema20   = df["close"].ewm(span=20, adjust=False).mean().iloc[-1]
@@ -307,21 +289,21 @@ class SignalEngine:
             ema20   = price
             ext_pct = 0.0
 
-        # ── v4.0: Opening momentum bonus (9:15-9:30 candles) ──
+        # ── Opening momentum bonus ─────────────────────────────────────
         session_min = float(feat.iloc[0].get("session_min", 999))
         orb_break   = int(feat.iloc[0].get("orb_break", 0))
         is_opening  = session_min <= 15
 
-        # ── Determine direction ────────────────────────────────
-        # FIX-4: BUY_THRESHOLD_DEFAULT raised 0.52 -> 0.55 (in config)
-        # FIX-5: SELL_THRESHOLD_DEFAULT raised 0.52 -> 0.60 (in config)
+        # ── Thresholds (adaptive per regime) ──────────────────────────
         buy_thr  = cfg.BUY_THRESHOLD_WEAK  if nifty_regime == "WEAK" else cfg.BUY_THRESHOLD_DEFAULT
-        sell_thr = getattr(cfg, "SELL_THRESHOLD_WEAK", 0.58) if nifty_regime == "WEAK" else getattr(cfg, "SELL_THRESHOLD_DEFAULT", 0.60)
+        sell_thr = (getattr(cfg, "SELL_THRESHOLD_WEAK",    0.58)
+                    if nifty_regime == "WEAK"
+                    else getattr(cfg, "SELL_THRESHOLD_DEFAULT", 0.60))
 
         breakout_ok = int(feat.iloc[0].get("breakout_confirm", 1))
         above_vwap  = int(feat.iloc[0].get("above_vwap",  1))
 
-        # ── BUY signal evaluation ──────────────────────────────
+        # ── BUY signal evaluation ──────────────────────────────────────
         action_buy  = False
         prob_buy    = prob_long
 
@@ -344,10 +326,7 @@ class SignalEngine:
             if prob_buy >= buy_thr:
                 action_buy = True
 
-        # ── SELL signal evaluation ─────────────────────────────
-        # FIX-5: threshold 0.52->0.60 enforced via config (SELL_THRESHOLD_DEFAULT)
-        # This means prob_short = 1 - prob_long must be >= 0.60, meaning
-        # prob_long <= 0.40. Model must be strongly bearish to short.
+        # ── SELL signal evaluation ─────────────────────────────────────
         action_sell = False
         prob_sell   = prob_short
 
@@ -368,7 +347,7 @@ class SignalEngine:
                 if prob_sell >= sell_thr:
                     action_sell = True
 
-        # ── Pick stronger signal ───────────────────────────────
+        # ── Pick stronger signal ───────────────────────────────────────
         if action_buy and action_sell:
             if prob_buy >= prob_sell:
                 action_sell = False
@@ -378,18 +357,18 @@ class SignalEngine:
         if not action_buy and not action_sell:
             return reject(f"LOW_PROB(buy={prob_buy:.3f} sell={prob_sell:.3f})")
 
-        # ── SL / TP calculation ────────────────────────────────
+        # ── SL / TP calculation using adaptive tp_mult ─────────────────
         if action_buy:
             sl     = max(price - cfg.ATR_SL_MULT * atr, price * (1 - cfg.MAX_SL_PCT))
             sl     = min(sl, price * (1 - cfg.MIN_SL_PCT))
-            target = price + cfg.ATR_TP_MULT * atr
+            target = price + tp_mult * atr         # GAP-2/3: adaptive TP
             rr     = ((target - price) / (price - sl)) if price > sl else 0
             side   = "LONG"
             prob   = prob_buy
         else:
             sl     = min(price + cfg.ATR_SL_MULT * atr, price * (1 + cfg.MAX_SL_PCT))
             sl     = max(sl, price * (1 + cfg.MIN_SL_PCT))
-            target = price - cfg.ATR_TP_MULT * atr
+            target = price - tp_mult * atr         # GAP-2/3: adaptive TP
             rr     = ((price - target) / (sl - price)) if sl > price else 0
             side   = "SHORT"
             prob   = prob_sell
@@ -397,7 +376,7 @@ class SignalEngine:
         if rr < cfg.MIN_RR_RATIO:
             return reject(f"LOW_RR({rr:.2f})")
 
-        # ── qty_factor from symbol penalty ─────────────────────
+        # ── qty_factor from symbol penalty ────────────────────────────
         qty_factor = 1.0
         if penalty is not None:
             qty_factor = penalty.penalty_factor(symbol) if hasattr(penalty, "penalty_factor") else 1.0
@@ -415,12 +394,13 @@ class SignalEngine:
             "atr":           round(atr,    2),
             "rr_ratio":      round(rr,     2),
             "prob":          round(prob,   4),
+            "tp_mult":       round(tp_mult, 2),   # stored for trade_manager
             "reject_reason": None,
         })
         self._log(symbol, result)
         log.info(
             f"{action} {symbol} entry={price:.2f} sl={sl:.2f} tp={target:.2f} "
-            f"prob={prob:.4f} rr={rr:.2f} side={side} qty_factor={qty_factor:.2f}"
+            f"prob={prob:.4f} rr={rr:.2f} side={side} tp_mult={tp_mult:.1f}x"
         )
         return result
 
@@ -457,6 +437,7 @@ class SignalEngine:
             "target":        result["target"],
             "reject_reason": result.get("reject_reason", ""),
             "qty_factor":    result.get("qty_factor", 1.0),
+            "tp_mult":       result.get("tp_mult", cfg.ATR_TP_MULT),
         }
         write_header = self._needs_header(cfg.SIGNAL_LOG_PATH)
         pd.DataFrame([row]).to_csv(
@@ -465,7 +446,7 @@ class SignalEngine:
         )
 
 
-# ── Nifty regime ─────────────────────────────────────────────
+# ── Nifty regime ──────────────────────────────────────────────────────
 def get_nifty_regime(nifty_df) -> tuple:
     cached = _safe_get("bot:nifty:regime")
     if cached:

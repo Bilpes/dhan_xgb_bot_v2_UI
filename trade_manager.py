@@ -1,24 +1,25 @@
 """trade_manager.py — full execution layer for dhan_xgb_bot_v2/v3/v4
 
-v4.2 Changes 2026-07-18:
-* FIX-3: compute_qty cap raised from 0.20 → 0.30 of capital.
-  With Rs1L capital and 0.20 cap, high-price stocks (Rs1000+) get
-  capped at only 20 shares — too little to make Rs500/day target.
-  0.30 cap = Rs30,000 max per trade, enough to carry meaningful qty.
-* FIX-3: Added explicit qty=0 guard with log warning instead of silent skip.
-  Previously qty<=0 was silently returning False with no log trace.
-* can_trade() third gate removed (DAILY_TARGET check duplicated here AND
-  in bot._can_enter_new). Removed from here — bot._can_enter_new() is the
-  single authoritative gate.
+v4.4 Changes 2026-07-18:
+* SIZING REWORK — 'No cap, Rs1L per trade slot':
+  compute_qty now uses SLOT BUDGET instead of a capital-percentage cap.
+  slot_budget = CAPITAL / MAX_OPEN_POSITIONS
+             = Rs4,00,000 / 4 = Rs1,00,000 per slot
+  qty = floor(slot_budget / entry_price)
+  e.g. Rs1000 stock -> qty = floor(1,00,000 / 1000) = 100 shares
+  No arbitrary 20%/30% cap. Full slot budget deployed.
+  Risk is still controlled via SL (qty * sl_pts capped at RISK_PER_TRADE * capital).
+  We take the SMALLER of: risk-based qty OR slot-budget qty.
+  This ensures:
+    - Never exceed Rs1L per slot (capital protection)
+    - Never risk more than Rs6000 per trade (loss protection)
+    - On Rs1000 stock: qty=100, SL Rs6 away -> risk=Rs600 (well within)
 
-v4.0 Changes 2026-07-17:
-* SHORT (SELL) position support — Position now has a side field (LONG/SHORT)
-* P&L for SHORT = (entry - exit_price) * qty
-* enter() now reads sig[side] and sig[action] to determine direction
-* _place_order() uses SELL for SHORT entry and BUY for SHORT exit
-* check_exits() applies SL/TP correctly for both LONG and SHORT
+v4.3 Changes 2026-07-18 (retained):
+  FIX-3 explicit qty=0 guard, can_trade() DAILY_TARGET gate removed.
 
-All prior fixes (ISSUE-13 through ISSUE-21, FIX-15) retained.
+v4.0 Changes 2026-07-17 (retained):
+  SHORT position support, side=LONG/SHORT throughout.
 """
 
 from __future__ import annotations
@@ -46,9 +47,9 @@ class Position:
     sl:         float
     tp:         float
     atr:        float
-    side:       str   = "LONG"   # v4: 'LONG' or 'SHORT'
+    side:       str   = "LONG"
     peak:       float = 0.0
-    trough:     float = 0.0      # v4: for SHORT trailing SL
+    trough:     float = 0.0
     trailing_active: bool = False
     current_sl: float = 0.0
     opened_at:  datetime = field(default_factory=datetime.now)
@@ -104,14 +105,6 @@ class TradeManager:
         log.info("[TradeManager] WatchlistManager linked.")
 
     def can_trade(self) -> bool:
-        """Check if a new trade is allowed.
-
-        FIX-3 v4.2: Removed the DAILY_TARGET duplicate check from here.
-        The authoritative gate is bot._can_enter_new() which checks
-        DAILY_TARGET + regime + profit-lock together.
-        Keeping it here caused false rejections when daily_pnl was
-        correctly handled upstream.
-        """
         self._reset_daily_if_needed()
         if self._daily_cb_tripped:
             log.warning("[TradeManager] Daily-loss CB ACTIVE.")
@@ -126,69 +119,98 @@ class TradeManager:
             count = sum(1 for p in self.positions.values() if p.sector == sector)
         return count < cfg.MAX_PER_SECTOR
 
-    def compute_sl_tp(self, entry: float, atr: float, side: str = "LONG") -> tuple:
+    def compute_sl_tp(self, entry: float, atr: float, side: str = "LONG",
+                      tp_mult: float = None) -> tuple:
+        """Compute SL and TP.
+        GAP-3: tp_mult can be passed dynamically (1.8 choppy, 2.5 bull).
+        Defaults to cfg.ATR_TP_MULT if not provided.
+        """
+        if tp_mult is None:
+            tp_mult = cfg.ATR_TP_MULT
+
         if side == "SHORT":
             raw_sl = entry + cfg.ATR_SL_MULT * atr
-            raw_tp = entry - cfg.ATR_TP_MULT * atr
             sl = min(raw_sl, entry * (1 + cfg.MAX_SL_PCT))
             sl = max(sl,     entry * (1 + cfg.MIN_SL_PCT))
             sl_pts = sl - entry
-            tp     = entry - sl_pts * (cfg.ATR_TP_MULT / cfg.ATR_SL_MULT)
+            tp     = entry - sl_pts * (tp_mult / cfg.ATR_SL_MULT)
             rr     = (entry - tp) / max(sl - entry, 1e-6)
         else:
             raw_sl = entry - cfg.ATR_SL_MULT * atr
-            raw_tp = entry + cfg.ATR_TP_MULT * atr
             sl = max(raw_sl, entry * (1 - cfg.MAX_SL_PCT))
             sl = min(sl,     entry * (1 - cfg.MIN_SL_PCT))
             sl_pts = entry - sl
-            tp     = entry + sl_pts * (cfg.ATR_TP_MULT / cfg.ATR_SL_MULT)
+            tp     = entry + sl_pts * (tp_mult / cfg.ATR_SL_MULT)
             rr     = (tp - entry) / max(entry - sl, 1e-6)
         return round(sl, 2), round(tp, 2), round(rr, 4)
 
     def compute_qty(self, entry: float, sl: float) -> int:
-        """Compute share quantity based on risk per trade.
+        """Compute share quantity — SLOT BUDGET approach.
 
-        FIX-3 v4.2:
-        - Cap raised from 0.20 → 0.30 of capital.
-          With Rs1L capital: max Rs30,000 per trade.
-          Previously Rs20,000 cap was too low for high-price stocks
-          (e.g. Rs800 stock: old cap = 25 shares, new = 37 shares).
-        - Added explicit qty=0 guard with log warning so we never
-          silently enter with 0 shares.
+        v4.4: No percentage cap. Each trade slot gets:
+            slot_budget = CAPITAL / MAX_OPEN_POSITIONS
+
+        qty is the MINIMUM of:
+          (a) risk-based qty  = floor(risk_amount / sl_pts)
+              caps downside risk at RISK_PER_TRADE * CAPITAL
+          (b) slot-based qty  = floor(slot_budget / entry)
+              caps capital deployment to 1 slot (Rs1L on Rs4L / 4 trades)
+
+        Example — Rs1000 stock, ATR=Rs5, SL=Rs6:
+          risk_amount  = 0.015 * 4,00,000 = Rs6,000
+          risk_qty     = floor(6000 / 6)  = 1000  shares (risk-only)
+          slot_budget  = 4,00,000 / 4     = Rs1,00,000
+          slot_qty     = floor(1,00,000 / 1000) = 100  shares  <- BINDING
+          Final qty    = min(1000, 100)   = 100 shares
+          Capital used = 100 * 1000       = Rs1,00,000 ✅
+          Actual risk  = 100 * 6          = Rs600 (well within Rs6000 limit)
         """
         sl_pts = abs(entry - sl)
         if sl_pts <= 0:
-            log.warning("[compute_qty] %s: sl_pts=0, cannot size — skipping.", entry)
+            log.warning("[compute_qty] sl_pts=0 for entry=%.2f — skipping.", entry)
             return 0
+
+        # (a) Risk-based qty
         risk_amount = cfg.RISK_PER_TRADE * self.capital
-        qty = math.floor(risk_amount / sl_pts)
-        # FIX-3: raised cap from 0.20 → 0.30
-        max_qty = math.floor(self.capital * 0.30 / entry)
-        qty = min(qty, max_qty)
+        risk_qty    = math.floor(risk_amount / sl_pts)
+
+        # (b) Slot-based qty — slot_budget = CAPITAL / MAX_OPEN_POSITIONS
+        slot_budget = self.capital / max(cfg.MAX_OPEN_POSITIONS, 1)
+        slot_qty    = math.floor(slot_budget / entry)
+
+        qty = min(risk_qty, slot_qty)
+
         if qty <= 0:
             log.warning(
-                "[compute_qty] entry=%.2f sl=%.2f risk=%.0f → qty=%d (capped). "
-                "Trade skipped — check ATR or capital.",
-                entry, sl, risk_amount, qty,
+                "[compute_qty] entry=%.2f sl=%.2f slot_budget=%.0f slot_qty=%d "
+                "risk_qty=%d -> qty=0. Skipped.",
+                entry, sl, slot_budget, slot_qty, risk_qty,
             )
             return 0
+
+        log.info(
+            "[compute_qty] %s: entry=%.2f sl_pts=%.2f "
+            "risk_qty=%d slot_qty=%d -> qty=%d (capital_used=Rs%.0f)",
+            entry, entry, sl_pts, risk_qty, slot_qty, qty, qty * entry,
+        )
         return qty
 
     def enter(self, symbol: str, sig: dict) -> bool:
-        """Wrapper for bot.py. sig has keys: action, side, entry, sl, target, prob, atr."""
-        side = sig.get("side", "LONG")
+        side    = sig.get("side", "LONG")
+        tp_mult = sig.get("tp_mult", cfg.ATR_TP_MULT)
         return self.enter_trade(
-            symbol = symbol,
-            entry  = sig.get("entry",    0.0),
-            atr    = sig.get("atr",      0.0),
-            prob   = sig.get("prob",     0.0),
-            rr     = sig.get("rr_ratio", None),
-            side   = side,
+            symbol  = symbol,
+            entry   = sig.get("entry",    0.0),
+            atr     = sig.get("atr",      0.0),
+            prob    = sig.get("prob",     0.0),
+            rr      = sig.get("rr_ratio", None),
+            side    = side,
+            tp_mult = tp_mult,
         )
 
     def enter_trade(self, symbol: str, entry: float, atr: float,
                     prob: float, rr: Optional[float] = None,
-                    side: str = "LONG") -> bool:
+                    side: str = "LONG", tp_mult: float = None) -> bool:
 
         if not self.can_trade():
             return False
@@ -201,7 +223,7 @@ class TradeManager:
             if symbol in self.positions:
                 return False
 
-        sl, tp, computed_rr = self.compute_sl_tp(entry, atr, side)
+        sl, tp, computed_rr = self.compute_sl_tp(entry, atr, side, tp_mult)
         actual_rr = rr if rr is not None else computed_rr
 
         if actual_rr < cfg.MIN_RR_RATIO:
@@ -210,9 +232,8 @@ class TradeManager:
 
         qty = self.compute_qty(entry, sl)
         if qty <= 0:
-            # FIX-3: explicit log instead of silent skip
             log.warning(
-                "[TradeManager] %s qty=0 after sizing (entry=%.2f sl=%.2f capital=%.0f) — SKIPPED.",
+                "[TradeManager] %s qty=0 (entry=%.2f sl=%.2f capital=%.0f) — SKIPPED.",
                 symbol, entry, sl, self.capital,
             )
             return False
@@ -225,8 +246,10 @@ class TradeManager:
         if cfg.PAPER_TRADE:
             direction = "SELL(SHORT)" if side == "SHORT" else "BUY(LONG)"
             log.info(
-                "[PAPER] %s %s qty=%d entry=%.2f sl=%.2f tp=%.2f rr=%.2f prob=%.3f",
+                "[PAPER] %s %s qty=%d entry=%.2f sl=%.2f tp=%.2f "
+                "rr=%.2f prob=%.3f capital_used=Rs%.0f",
                 direction, symbol, qty, entry, sl, tp, actual_rr, prob,
+                qty * entry,
             )
         else:
             order_side = "SELL" if side == "SHORT" else "BUY"
@@ -312,7 +335,7 @@ class TradeManager:
                     if new_sl > pos.current_sl:
                         pos.current_sl = new_sl
                         return new_sl
-            else:  # SHORT
+            else:
                 gain_atr = (pos.entry - last_price) / pos.atr if pos.atr > 0 else 0.0
                 if not pos.trailing_active:
                     if gain_atr >= cfg.TRAILING_SL_ACTIVATE_MULT:
@@ -344,7 +367,7 @@ class TradeManager:
             if high >= pos.tp:
                 self.exit_trade(symbol, pos.tp, reason="TP")
                 return "TP"
-        else:  # SHORT
+        else:
             if high >= pos.current_sl:
                 self.exit_trade(symbol, pos.current_sl, reason="SL")
                 return "SL"

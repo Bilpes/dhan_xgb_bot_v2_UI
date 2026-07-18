@@ -1,36 +1,35 @@
 # ============================================================
-#  config/config.py  —  Infrastructure, paths, API keys,
+#  config/config.py  — Infrastructure, paths, API keys,
 #                        timing, filters, Redis, Telegram.
 #
-#  v4.3 PATCH 2026-07-18:
-#   CAPITAL corrected to Rs1,00,000 (was wrongly set to Rs4L).
+#  v4.4 PATCH 2026-07-18:
 #
-#   FIX-1:  CAPITAL = 1_00_000  (Rs1 Lakh — actual trading capital)
-#   FIX-2:  MAX_RISK_PCT = 0.015 (Rs1500 risk/trade; needed for Rs500/day)
-#            Math: 40% win rate * Rs3750 TP - 60% * Rs1500 SL - charges
-#                  = ~Rs530/day net. Previously 0.01 (Rs1000) only gave ~Rs260.
-#   FIX-3:  MAX_CAPITAL_PER_TRADE raised 0.20 -> 0.30 (already done in
-#            trade_manager v4.2; aligned here for consistency)
-#   FIX-4:  BUY_THRESHOLD_DEFAULT raised 0.52 -> 0.55
-#            At 0.52 the model barely beats random; after brokerage+STT+ETC+GST
-#            (~Rs80-150/trade) break-even win rate is ~54%. 0.55 gives margin.
-#   FIX-5:  SELL_THRESHOLD_DEFAULT raised 0.52 -> 0.60
-#            prob_short = 1 - prob_long is a proxy. Using it at 0.52 generates
-#            false shorts on NEUTRAL regime. 0.60 means model must be strongly
-#            bearish before shorting.
-#   FIX-6:  NO_REENTRY_MINUTES lowered 60 -> 30
-#            60-minute block missed genuine reversals. 30 min is enough to avoid
-#            re-entering a broken stock while still catching trend continuations.
-#   FIX-7:  AVOID_LUNCH_HOURS = True (12:30-13:00)
-#            Low-volume, choppy, mean-reverting. Was False, generating losing
-#            trades on false breakouts. Now skipped entirely.
+#  SIZING INTENT (user):
+#    Paper mode: 4L total capital, 4 open trades = Rs1L per trade slot.
+#    'Don't cap anything' — each trade gets its full slot budget.
+#    On Rs1000 stock: qty = floor(1,00,000 / 1000) = 100 shares.
+#    TP at 1.8x ATR (e.g. Rs9/share) * 100 = Rs900 per winner.
+#    SL at 1.2x ATR (e.g. Rs6/share) * 100 = -Rs600 per loser.
 #
-#  v4.1 PATCH 2026-07-17:
-#   - PROFIT_LOCK_FLOOR     = 500   (never fall below Rs500 once hit)
-#   - PROFIT_PULLBACK_RS    = 45    (if pnl peaks at 550 then drops to 505, exit)
-#   - POST_TARGET_BULL_ONLY = True  (new entries after target ONLY on BULL+above_res)
-#   - NIFTY_WEAK_HARD_STOP  = True  (WEAK regime = no new entries at all)
-#   - NIFTY_RESISTANCE_MULT = 1.002 (nifty close must be > ema50 * this)
+#  CAPITAL = 4,00,000 (paper mode; 4 slots x Rs1L each)
+#  MAX_CAPITAL_PER_TRADE = 1.00 (NO cap — full slot budget per trade)
+#  Per-slot budget computed as: CAPITAL / MAX_OPEN_POSITIONS
+#
+#  GAP-1: SIDEWAYS_NIFTY_THRESH = 0.003
+#         When abs(nifty_5c_return) < 0.003 AND regime=NEUTRAL for
+#         3 consecutive scans -> treat day as SIDEWAYS, block new entries.
+#
+#  GAP-2: ATR_TP_MULT = 1.8 (was 2.5)
+#         Choppy/range-bound market — price rarely travels 2.5x ATR.
+#         1.8x TP hits more frequently. RR = 1.8/1.2 = 1.5 (valid).
+#
+#  GAP-3: ATR_TP_MULT_BULL = 2.5
+#         On confirmed BULL days, signal_engine dynamically uses 2.5x.
+#         On NEUTRAL/WEAK, uses ATR_TP_MULT (1.8x).
+#
+#  v4.3 changes (2026-07-18) retained:
+#    CAPITAL corrected, MAX_RISK_PCT=0.015, thresholds 0.55/0.60,
+#    NO_REENTRY_MINUTES=30, AVOID_LUNCH_HOURS=True
 # ============================================================
 
 import os
@@ -52,12 +51,12 @@ def _find_and_load_env() -> bool:
     for path in candidates:
         if path.exists():
             load_dotenv(dotenv_path=str(path), override=True)
-            print(f"[config] \u2705  Loaded .env from: {path}")
+            print(f"[config] ✅  Loaded .env from: {path}")
             return True
     print(
-        "\n[config] \u26a0\ufe0f  WARNING: No .env file found.\n"
+        "\n[config] ⚠️  WARNING: No .env file found.\n"
         "  Expected location: config/.env\n"
-        "  Copy config/.env.example \u2192 config/.env and fill in your credentials.\n"
+        "  Copy config/.env.example → config/.env and fill in your credentials.\n"
     )
     return False
 
@@ -75,62 +74,61 @@ TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID",   "")
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 
 
-# ── Capital & position sizing ────────────────────────────────
-# FIX-1: Corrected to Rs1,00,000 (Rs1 Lakh actual capital)
-# Previously was wrongly set to Rs4,00,000 which made qty sizing
-# and daily-loss limits use a 4x inflated base.
-CAPITAL               = 1_00_000
+# ── Capital & position sizing ────────────────────────────────────────
+# Paper mode: 4L total capital, 4 open trade slots = Rs1L per slot.
+# Each slot budget = CAPITAL / MAX_OPEN_POSITIONS = Rs1,00,000.
+# No per-trade cap (MAX_CAPITAL_PER_TRADE = 1.0).
+#
+# Qty sizing on a Rs1000 stock:
+#   slot_budget  = 4,00,000 / 4 = Rs1,00,000
+#   qty          = floor(1,00,000 / 1000) = 100 shares
+#   SL distance  = 1.2 * ATR (e.g. Rs6)  -> risk = 100 * Rs6 = Rs600
+#   TP distance  = 1.8 * ATR (e.g. Rs9)  -> gain = 100 * Rs9 = Rs900
+#   Daily target Rs500 needs ~1 winning trade (Rs900) or 2 moderate ones.
+CAPITAL               = 4_00_000     # Paper: 4L total (4 slots × Rs1L)
 TOTAL_CAPITAL         = CAPITAL
 
-# FIX-2: 1.5% risk per trade = Rs1500 on Rs1L capital.
-# This is the key lever for Rs500/day:
-#   Expected value per trade = 0.40 * (2.5 * 1500) - 0.60 * 1500
-#                            = 0.40 * 3750 - 0.60 * 1500
-#                            = 1500 - 900 = Rs600 expected/trade
-#   After charges (~Rs120):  Rs480/trade
-#   2 trades/day needed on average to clear Rs500 target.
-MAX_RISK_PCT          = 0.015
+MAX_RISK_PCT          = 0.015        # 1.5% risk — Rs6000 on Rs4L
 RISK_PER_TRADE        = MAX_RISK_PCT
 
-# FIX-3: 30% of capital per trade max = Rs30,000
-# Allows meaningful qty on mid-price stocks (Rs400-Rs1500 range)
-MAX_CAPITAL_PER_TRADE = 0.30
+# NO cap: each trade slot uses its full budget (CAPITAL / MAX_OPEN_POSITIONS)
+# compute_qty uses slot_budget = CAPITAL / MAX_OPEN_POSITIONS
+MAX_CAPITAL_PER_TRADE = 1.00        # 100% — no restriction; slot budgeting handles this
 
-MAX_PER_SECTOR        = 3
-MAX_OPEN_TRADES       = 3
+MAX_PER_SECTOR        = 2           # max 2 positions in same sector (was 3)
+MAX_OPEN_TRADES       = 4
 MAX_OPEN_POSITIONS    = MAX_OPEN_TRADES
 
-# Daily loss limit: 2% of Rs1L = Rs2,000 max daily loss
+# Daily loss limit: 2% of Rs4L = Rs8,000 max daily loss (paper)
 DAILY_LOSS_LIMIT      = 0.02
 MAX_DAILY_LOSS        = DAILY_LOSS_LIMIT
 
 
-# ── Daily P&L management (v4.1) ────────────────────────────
-# Rs500 target per day (0.5% of Rs1L capital — achievable).
+# ── Daily P&L management ─────────────────────────────────────────────
+# Rs500 target per day = 0.125% of Rs4L paper capital.
 DAILY_TARGET          = 500.0
-
-# Once daily_pnl >= DAILY_TARGET, we never let it fall below PROFIT_LOCK_FLOOR.
-# If pnl was 550 and falls back below (550 - PROFIT_PULLBACK_RS = 505), force-exit
-# all positions immediately to lock in profit.
-PROFIT_LOCK_FLOOR     = 500.0    # absolute floor in Rs — never fall below this
-PROFIT_PULLBACK_RS    = 45.0     # if peak_pnl - current_pnl >= this, exit all
-
-# After target hit, allow NEW entries only on confirmed BULL day
-# (regime=BULL AND Nifty above EMA50 * NIFTY_RESISTANCE_MULT).
+PROFIT_LOCK_FLOOR     = 500.0
+PROFIT_PULLBACK_RS    = 45.0
 POST_TARGET_BULL_ONLY    = True
-NIFTY_RESISTANCE_MULT    = 1.002   # nifty must be 0.2% above its EMA50 to qualify
-
-# WEAK regime (nifty falling): hard-stop all new entries.
+NIFTY_RESISTANCE_MULT    = 1.002
 NIFTY_WEAK_HARD_STOP     = True
 
 
-# ── Trade mode ──────────────────────────────────────────────
+# ── GAP-1: Sideways day detection ────────────────────────────────────
+# When Nifty 5-candle return < this threshold AND regime stays NEUTRAL
+# for SIDEWAYS_CONSECUTIVE_SCANS scans, declare it a SIDEWAYS day.
+# No new entries on sideways days — only manage existing positions.
+SIDEWAYS_NIFTY_THRESH        = 0.003   # 0.3% threshold
+SIDEWAYS_CONSECUTIVE_SCANS   = 3       # 3 consecutive NEUTRAL scans = sideways day
+
+
+# ── Trade mode ────────────────────────────────────────────────────────
 TRADE_MODE      = "intraday"
 PAPER_TRADE     = os.getenv("BOT_MODE", "paper").lower() != "live"
 ALLOW_SHORTS    = True
 
 
-# ── Timing ──────────────────────────────────────────────────
+# ── Timing ───────────────────────────────────────────────────────────
 CANDLE_INTERVAL      = "5"
 LOOKBACK_CANDLES     = 60
 INTRADAY_CUTOFF      = "15:15"
@@ -147,7 +145,7 @@ NO_NEW_TRADE_AFTER  = _t("15:00")
 AUTO_EXIT_TIME      = _t("15:15")
 
 
-# ── Entry quality filters ───────────────────────────────────
+# ── Entry quality filters ─────────────────────────────────────────────
 STOP_LOSS_PCT                = 0.020
 MIN_STOCK_PRICE              = 50.0
 MIN_VOLUME_RATIO             = 0.50
@@ -159,7 +157,16 @@ MAX_DISTANCE_FROM_VWAP       = 0.05
 MIN_SL_PCT                   = 0.004
 MAX_SL_PCT                   = 0.035
 ATR_SL_MULT                  = 1.2
-ATR_TP_MULT                  = 2.5
+
+# GAP-2: TP multiplier — 1.8x for choppy/range market (was 2.5x)
+# RR = 1.8 / 1.2 = 1.5 — exactly meets MIN_RR_RATIO. Valid.
+# More TP hits in sideways-to-mild-trending conditions.
+ATR_TP_MULT                  = 1.8
+
+# GAP-3: BULL day TP multiplier — 2.5x on confirmed trend days
+# signal_engine uses this when regime == "BULL" + nifty_above_resistance
+ATR_TP_MULT_BULL             = 2.5
+
 SIDEWAYS_ATR_RATIO           = 0.80
 
 REQUIRE_BREAKOUT_CONFIRMATION= True
@@ -169,62 +176,43 @@ MAX_EXTENSION_PCT            = 0.030
 VWAP_SOFT_PENALTY            = 0.03
 
 
-# ── Signal thresholds ───────────────────────────────────────
-# FIX-4: BUY_THRESHOLD_DEFAULT raised 0.52 -> 0.55
-# Rationale: With charges Rs80-150/trade, break-even win rate = ~54%.
-# 0.55 threshold ensures model has genuine edge before entering.
-# WEAK regime keeps 0.58 (even stricter on bad days — correct).
+# ── Signal thresholds ─────────────────────────────────────────────────
 BUY_THRESHOLD_DEFAULT        = 0.55
 BUY_THRESHOLD_WEAK           = 0.58
-
-# FIX-5: SELL_THRESHOLD_DEFAULT raised 0.52 -> 0.60
-# prob_short = 1.0 - prob_long is an approximation, not a trained short signal.
-# Using it at 0.52 generates false shorts on NEUTRAL/BULL days.
-# 0.60 means model must show strong DOWN confidence before shorting.
-# SELL_THRESHOLD_WEAK stays at 0.58 (WEAK regime shorts are more reliable).
 SELL_THRESHOLD_DEFAULT       = 0.60
 SELL_THRESHOLD_WEAK          = 0.58
-
 MIN_RR_RATIO                 = 1.5
 
 
-# ── Symbol penalty ──────────────────────────────────────────
+# ── Symbol penalty ────────────────────────────────────────────────────
 PENALTY_LOOKBACK             = 3
 PENALTY_MIN_LOSS             = 1200
 
 
-# ── Re-entry protection ─────────────────────────────────────
-# FIX-6: Lowered from 60 -> 30 minutes.
-# 60-minute block was too aggressive — blocked re-entry on genuine
-# trend continuations and reversals (e.g. stock hit SL at 9:45,
-# bull trend resumed at 10:00 — old code blocked until 10:45).
-# 30 minutes is enough to avoid whipsaw while keeping setups open.
+# ── Re-entry protection ───────────────────────────────────────────────
 NO_REENTRY_MINUTES = 30
 
 
-# ── Lunch hours ─────────────────────────────────────────────
-# FIX-7: Set to True. 12:30-13:00 is low-volume, choppy, mean-reverting.
-# Bot was generating losing trades on false breakouts during this window.
-# Skipping it entirely is the correct production approach.
+# ── Lunch hours ───────────────────────────────────────────────────────
 AVOID_LUNCH_HOURS  = True
 LUNCH_START        = "12:30"
 LUNCH_END          = "13:00"
 
 
-# ── Trailing stop ───────────────────────────────────────────
+# ── Trailing stop ─────────────────────────────────────────────────────
 TRAIL_AFTER_PCT              = 0.012
 TRAIL_DISTANCE               = 0.010
 TRAILING_SL_ACTIVATE_MULT    = 0.8
 TRAILING_SL_TRAIL_MULT       = 1.2
 
 
-# ── Position rotation ───────────────────────────────────────
+# ── Position rotation ─────────────────────────────────────────────────
 ROTATION_ENABLED   = True
 ROTATION_MIN_PROFIT= 0.005
 ROTATION_MIN_EDGE  = 0.05
 
 
-# ── Watchlist ───────────────────────────────────────────────
+# ── Watchlist ─────────────────────────────────────────────────────────
 NIFTY50_SECURITY_ID = 13
 
 _WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "..", "watchlist.json")
@@ -262,15 +250,15 @@ def _load_watchlist():
             missing.append(sym)
 
     if missing:
-        print(f"[config] \u26a0\ufe0f  {len(missing)} symbols missing SECURITY_ID: {missing}")
-    print(f"[config] \u2705  Watchlist: {len(watchlist)} symbols ({len(tier_a)} A + {len(tier_b)} B)")
+        print(f"[config] ⚠️  {len(missing)} symbols missing SECURITY_ID: {missing}")
+    print(f"[config] ✅  Watchlist: {len(watchlist)} symbols ({len(tier_a)} A + {len(tier_b)} B)")
     return watchlist, sector_map
 
 
 WATCHLIST, SECTOR_MAP = _load_watchlist()
 
 
-# ── Model paths ─────────────────────────────────────────────
+# ── Model paths ───────────────────────────────────────────────────────
 MODEL_PATH         = "models/xgb_model.pkl"
 SCALER_PATH        = "models/scaler.pkl"
 FEATURE_PATH       = "models/feature_cols.pkl"
@@ -278,7 +266,7 @@ BACKUP_MODEL_PATH  = "models/xgb_model_backup.pkl"
 BACKUP_SCALER_PATH = "models/scaler_backup.pkl"
 
 
-# ── Logging paths ────────────────────────────────────────────
+# ── Logging paths ─────────────────────────────────────────────────────
 LOG_FILE          = "logs/bot.log"
 TRADE_LOG         = "logs/trades.csv"
 TRADE_LOG_PATH    = TRADE_LOG
@@ -287,7 +275,7 @@ SIGNAL_LOG        = "logs/signal_scan.csv"
 SIGNAL_LOG_PATH   = SIGNAL_LOG
 
 
-# ── Retraining schedule ─────────────────────────────────────
+# ── Retraining schedule ───────────────────────────────────────────────
 RETRAIN_EVERY_DAYS  = 7
 EMBARGO_DAYS        = 14
 MIN_TRAIN_SAMPLES   = 3000
@@ -297,7 +285,7 @@ MIN_AUC             = 0.56
 MIN_PRECISION       = 0.52
 
 
-# ── Redis ────────────────────────────────────────────────────
+# ── Redis ─────────────────────────────────────────────────────────────
 REDIS_ENABLED            = os.getenv("REDIS_ENABLED", "false").lower() == "true"
 REDIS_HOST               = os.getenv("REDIS_HOST",     "localhost")
 REDIS_PORT               = int(os.getenv("REDIS_PORT",  "6379"))

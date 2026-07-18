@@ -1,24 +1,27 @@
 # bot.py — dhan_xgb_bot_v2
 # =============================================================
-# v4.1 PATCH 2026-07-17:
-#   1. PROFIT-LOCK EXIT: Once daily_pnl ever touches DAILY_TARGET (Rs500),
-#      bot tracks a peak_pnl high-water mark. If pnl then DROPS by
-#      PROFIT_PULLBACK_RS (Rs45) from that peak, ALL positions are
-#      force-exited immediately to lock in at least Rs455+.
-#      e.g. pnl peaks at Rs550, drops to Rs505 -> EXIT ALL.
+# v4.4 PATCH 2026-07-18:
 #
-#   2. POST-TARGET NEW ENTRIES (conditional):
-#      After target is hit, new entries are ALLOWED only when:
-#        a) regime == "BULL"  (Nifty in uptrend)
-#        b) Nifty close > Nifty EMA50 * NIFTY_RESISTANCE_MULT (0.2% above resistance)
-#      This lets the bot ride a genuine bull day while staying protected.
+#   GAP-1: SIDEWAYS DAY DETECTION
+#     New counter: _neutral_scan_count
+#     If Nifty regime stays NEUTRAL and abs(nifty_r5c) < SIDEWAYS_NIFTY_THRESH
+#     for SIDEWAYS_CONSECUTIVE_SCANS (3) scans in a row, bot sets
+#     self._sideways_day = True and blocks ALL new entries for the rest
+#     of the day. Existing positions are still managed (trailing SL, TP, EOD).
+#     Resets: _sideways_day cleared at EOD reset and when regime turns
+#     BULL or WEAK (those have their own entry logic).
 #
-#   3. NIFTY WEAK = HARD STOP:
-#      If regime == "WEAK" (Nifty below EMA20 and EMA50, sloping down),
-#      no new entries at all. Existing positions are still managed normally
-#      (trailing SL, TP checks, EOD exit).
+#   GAP-2: TP multiplier adaptive (1.8x choppy, 2.5x bull)
+#     signal_engine.get_signal() now receives nifty_regime and passes
+#     tp_mult=ATR_TP_MULT_BULL (2.5) on BULL days, ATR_TP_MULT (1.8) otherwise.
+#     trade_manager.compute_sl_tp() accepts tp_mult parameter.
+#     On choppy days: TP target is 1.8x ATR -> more frequent hits.
+#     On bull days:   TP target is 2.5x ATR -> ride the full trend move.
 #
-# All v4.0 changes retained.
+#   GAP-3: Implemented in signal_engine via tp_mult in signal dict.
+#
+# v4.1 changes retained (profit-lock, POST_TARGET_BULL_ONLY, WEAK hard-stop).
+# v4.0 changes retained (SHORT support).
 # =============================================================
 
 import time
@@ -63,11 +66,15 @@ class DhanXGBBot:
         self._tg    = TelegramBot(cfg.TELEGRAM_BOT_TOKEN) if _TG else None
         self.regime    = "NEUTRAL"
         self.nifty_r5c = 0.0
-        self.nifty_ema50 = 0.0        # v4.1: tracked for resistance check
+        self.nifty_ema50 = 0.0
 
-        # v4.1: high-water mark for profit-lock logic
+        # Profit-lock
         self._peak_pnl: float = 0.0
-        self._profit_locked: bool = False   # True once we've force-exited to protect target
+        self._profit_locked: bool = False
+
+        # GAP-1: Sideways day detection
+        self._neutral_scan_count: int = 0   # consecutive NEUTRAL+flat scans
+        self._sideways_day: bool = False    # True = skip all new entries today
 
         self.wm = WatchlistManager(
             dhan_client  = self.dhan,
@@ -76,7 +83,7 @@ class DhanXGBBot:
             feature_cols = self.engine.features,
         )
         self.tm.set_watchlist_manager(self.wm)
-        log.info("DhanXGBBot v4.1 — profit-lock + Nifty-conditional trades")
+        log.info("DhanXGBBot v4.4 — slot-budget sizing + sideways-skip + adaptive TP")
 
     def _connect(self):
         if cfg.PAPER_TRADE:
@@ -174,25 +181,59 @@ class DhanXGBBot:
     # Regime + Nifty resistance level
     # ----------------------------------------------------------------
     def update_regime(self):
-        """Update Nifty regime AND compute EMA50 for resistance check."""
+        """Update Nifty regime, EMA50, and sideways-day counter."""
         df = self.fetch_index("NIFTY50")
         if df is not None:
             self.regime, self.nifty_r5c = get_nifty_regime(df)
-            # v4.1: compute Nifty EMA50 for resistance level check
             try:
                 ema50_series = df["close"].ewm(span=50, adjust=False).mean()
                 self.nifty_ema50 = float(ema50_series.iloc[-1])
             except Exception:
                 self.nifty_ema50 = 0.0
+
+            # GAP-1: Track consecutive NEUTRAL+flat scans for sideways detection
+            sideways_thresh = getattr(cfg, "SIDEWAYS_NIFTY_THRESH", 0.003)
+            consec_needed   = getattr(cfg, "SIDEWAYS_CONSECUTIVE_SCANS", 3)
+
+            if self.regime == "NEUTRAL" and abs(self.nifty_r5c) < sideways_thresh:
+                self._neutral_scan_count += 1
+                log.debug(
+                    "[Sideways] NEUTRAL+flat scan #%d (need %d to declare sideways)",
+                    self._neutral_scan_count, consec_needed,
+                )
+            else:
+                # Regime changed to BULL or WEAK, or market is moving — reset counter
+                if self._neutral_scan_count > 0:
+                    log.debug(
+                        "[Sideways] Counter reset (regime=%s ret5c=%.4f)",
+                        self.regime, self.nifty_r5c,
+                    )
+                self._neutral_scan_count = 0
+                # If market breaks out of sideways, allow entries again
+                if self._sideways_day and self.regime in ("BULL", "WEAK"):
+                    log.info(
+                        "[Sideways] Regime turned %s — clearing sideways-day flag.",
+                        self.regime,
+                    )
+                    self._sideways_day = False
+
+            # Declare sideways day once threshold is hit
+            if (not self._sideways_day
+                    and self._neutral_scan_count >= consec_needed):
+                self._sideways_day = True
+                log.warning(
+                    "[Sideways] SIDEWAYS DAY declared after %d consecutive "
+                    "NEUTRAL+flat scans. No new entries for rest of session.",
+                    self._neutral_scan_count,
+                )
+                self.notify(
+                    f"⚠️ SIDEWAYS DAY detected | Nifty flat for {self._neutral_scan_count} "
+                    f"scans | No new entries | Existing positions managed normally."
+                )
         else:
             log.debug("Nifty fetch failed — keeping regime: %s", self.regime)
 
     def _nifty_above_resistance(self) -> bool:
-        """
-        Returns True if Nifty is trading ABOVE its EMA50 by at least
-        NIFTY_RESISTANCE_MULT (default 0.2%). This is the 'above resistance'
-        condition for allowing post-target new trades on a bull day.
-        """
         if self.nifty_ema50 <= 0:
             return False
         df = self.fetch_index("NIFTY50", n=5)
@@ -203,44 +244,44 @@ class DhanXGBBot:
         return nifty_close > self.nifty_ema50 * mult
 
     # ----------------------------------------------------------------
-    # v4.1: Profit-lock check — called every scan
+    # GAP-2/3: Determine adaptive TP multiplier for current conditions
+    # ----------------------------------------------------------------
+    def _get_tp_mult(self) -> float:
+        """Return TP multiplier based on market regime.
+
+        BULL + above resistance -> 2.5x ATR (ride the full trend move)
+        NEUTRAL / WEAK / SIDEWAYS -> 1.8x ATR (take quicker profit in chop)
+        """
+        if self.regime == "BULL" and self._nifty_above_resistance():
+            return getattr(cfg, "ATR_TP_MULT_BULL", 2.5)
+        return getattr(cfg, "ATR_TP_MULT", 1.8)
+
+    # ----------------------------------------------------------------
+    # v4.1: Profit-lock check
     # ----------------------------------------------------------------
     def _check_profit_lock(self) -> bool:
-        """
-        Manages the profit high-water mark.
-
-        Rules:
-          1. Once daily_pnl first hits DAILY_TARGET (Rs500), start tracking peak_pnl.
-          2. If peak_pnl – current_pnl >= PROFIT_PULLBACK_RS (Rs45), force-exit ALL.
-          3. After force-exit, set _profit_locked=True so we don't re-enter
-             unless Nifty is strongly bullish (POST_TARGET_BULL_ONLY check).
-
-        Returns True if a profit-lock exit was triggered this scan.
-        """
         daily_target   = getattr(cfg, "DAILY_TARGET",        500.0)
         pullback_rs    = getattr(cfg, "PROFIT_PULLBACK_RS",   45.0)
         current_pnl    = self.tm.daily_pnl
 
-        # Update peak only once target is crossed
         if current_pnl >= daily_target:
             if current_pnl > self._peak_pnl:
                 self._peak_pnl = current_pnl
                 log.info("[ProfitLock] New peak PnL: Rs%.2f", self._peak_pnl)
 
-        # Check pullback from peak
         if self._peak_pnl >= daily_target:
             drawdown = self._peak_pnl - current_pnl
             if drawdown >= pullback_rs:
                 if self.tm.positions:
                     log.warning(
                         "[ProfitLock] PULLBACK TRIGGERED: peak=Rs%.2f current=Rs%.2f "
-                        "drawdown=Rs%.2f ≥ Rs%.2f — force-exiting ALL positions.",
-                        self._peak_pnl, current_pnl, drawdown, pullback_rs,
+                        "drawdown=Rs%.2f — force-exiting ALL positions.",
+                        self._peak_pnl, current_pnl, drawdown,
                     )
                     self._force_exit_all(reason="PROFIT_LOCK")
                     self._profit_locked = True
                     self.notify(
-                        f"\U0001f512 PROFIT LOCK | Peak=Rs{self._peak_pnl:.0f} "
+                        f"🔒 PROFIT LOCK | Peak=Rs{self._peak_pnl:.0f} "
                         f"Current=Rs{current_pnl:.0f} — All positions exited. "
                         f"Locked PnL ≈ Rs{self.tm.daily_pnl:.0f}"
                     )
@@ -248,7 +289,6 @@ class DhanXGBBot:
         return False
 
     def _force_exit_all(self, reason: str = "FORCE"):
-        """Fetch latest price for each open position and exit."""
         for sym in list(self.tm.positions):
             df = self.fetch(sym, 3)
             ltp = (
@@ -259,22 +299,9 @@ class DhanXGBBot:
             self.tm.force_exit(sym, ltp, reason)
 
     # ----------------------------------------------------------------
-    # v4.1: Should we allow NEW entries right now?
+    # Gate: can we take new entries?
     # ----------------------------------------------------------------
     def _can_enter_new(self) -> bool:
-        """
-        Single gate for all new-entry decisions:
-
-        BLOCK new entries if ANY of:
-          - daily_loss_breached
-          - NIFTY_WEAK_HARD_STOP=True AND regime == "WEAK"
-          - _profit_locked AND NOT (BULL + above_resistance)
-
-        ALLOW new entries if:
-          - daily_pnl < DAILY_TARGET (normal operation), OR
-          - daily_pnl >= DAILY_TARGET BUT regime==BULL AND nifty above resistance
-            (only when POST_TARGET_BULL_ONLY=True)
-        """
         if self.tm.daily_loss_breached:
             return False
 
@@ -284,21 +311,22 @@ class DhanXGBBot:
             log.info("[Gate] WEAK regime — no new entries.")
             return False
 
+        # GAP-1: Sideways day = no new entries
+        if self._sideways_day:
+            log.info("[Gate] SIDEWAYS DAY — no new entries.")
+            return False
+
         daily_target = getattr(cfg, "DAILY_TARGET", 500.0)
         if self.tm.daily_pnl < daily_target:
-            # Normal operating mode — allow entries
             return True
 
-        # Past target: only allow if POST_TARGET_BULL_ONLY allows it
+        # Past target: only allow on BULL + above resistance
         post_bull_only = getattr(cfg, "POST_TARGET_BULL_ONLY", True)
         if not post_bull_only:
-            return False   # conservative: stop all new entries after target
+            return False
 
-        # Bull-only extension: regime must be BULL + Nifty above resistance
         if self.regime == "BULL" and self._nifty_above_resistance():
-            log.info(
-                "[Gate] Target hit but BULL+above_resistance — allowing new entry."
-            )
+            log.info("[Gate] Target hit but BULL+above_resistance — allowing new entry.")
             return True
 
         log.info(
@@ -313,7 +341,6 @@ class DhanXGBBot:
     def scan(self):
         now = datetime.now().time()
 
-        # EOD force-exit window
         if now >= cfg.AUTO_EXIT_TIME:
             self._force_exit_all(reason="EOD_CUTOFF")
             if not self.tm.positions:
@@ -323,24 +350,31 @@ class DhanXGBBot:
         if now < cfg.NO_NEW_TRADE_BEFORE:
             return
 
-        # Always manage open positions first (trailing SL, TP, profit-lock)
+        # Always manage open positions first
         self._manage_positions()
 
-        # v4.1: Check profit-lock pullback AFTER managing positions
+        # Check profit-lock
         if self._check_profit_lock():
-            return   # positions just exited — skip new entry scan
+            return
 
-        # Gate: can we take new entries?
+        # Gate check
         if not self._can_enter_new():
             log.info(
-                "Scan — new entries blocked | PnL=Rs%.2f regime=%s",
-                self.tm.daily_pnl, self.regime,
+                "Scan — new entries blocked | PnL=Rs%.2f regime=%s sideways=%s",
+                self.tm.daily_pnl, self.regime, self._sideways_day,
             )
             return
 
+        # Update regime AFTER gate (avoids expensive fetch when already blocked)
         self.update_regime()
 
-        # Seek new entries
+        # Re-check gate after regime update (sideways may have been declared)
+        if not self._can_enter_new():
+            return
+
+        # GAP-2/3: Compute adaptive TP multiplier for this scan
+        tp_mult = self._get_tp_mult()
+
         all_syms = get_watchlist()
         syms = [s for s in all_syms if s not in BLOCKED_SYMBOLS]
 
@@ -356,6 +390,7 @@ class DhanXGBBot:
                 sym, df, self.tm.positions,
                 self.regime, self.nifty_r5c,
                 daily_pnl=self.tm.daily_pnl,
+                tp_mult=tp_mult,           # GAP-2/3: pass adaptive multiplier
             )
 
             if sig["action"] in ("BUY", "SELL"):
@@ -365,17 +400,19 @@ class DhanXGBBot:
                         f"{sig['action']} {sym} [{sig.get('side','LONG')}] "
                         f"Rs{sig['entry']:.0f} SL={sig['sl']:.0f} "
                         f"TP={sig['target']:.0f} p={sig['prob']:.2f} "
-                        f"rr={sig.get('rr_ratio',0):.1f} regime={self.regime}"
+                        f"rr={sig.get('rr_ratio',0):.1f} "
+                        f"tp_mult={tp_mult:.1f}x regime={self.regime}"
                     )
 
         log.info(
-            "Scan done | open=%s | PnL=Rs%.2f | peak=Rs%.2f | regime=%s",
+            "Scan done | open=%s | PnL=Rs%.2f | peak=Rs%.2f | "
+            "regime=%s | sideways=%s | tp_mult=%.1fx",
             list(self.tm.positions), self.tm.daily_pnl,
-            self._peak_pnl, self.regime,
+            self._peak_pnl, self.regime, self._sideways_day, tp_mult,
         )
 
     # ----------------------------------------------------------------
-    # Position management (trailing SL + exit checks)
+    # Position management
     # ----------------------------------------------------------------
     def _manage_positions(self):
         for sym in list(self.tm.positions):
@@ -410,10 +447,10 @@ class DhanXGBBot:
         self.wm.run_scheduled()
 
         self.notify(
-            f"DhanXGBBot v4.1 started | PAPER={cfg.PAPER_TRADE} | "
-            f"BUY+SELL | Target=Rs{getattr(cfg,'DAILY_TARGET',500):.0f} | "
-            f"ProfitLock=Rs{getattr(cfg,'PROFIT_PULLBACK_RS',45):.0f} pullback | "
-            f"Start=09:15"
+            f"DhanXGBBot v4.4 started | PAPER={cfg.PAPER_TRADE} | "
+            f"Capital=Rs{cfg.CAPITAL:,.0f} | Slots={cfg.MAX_OPEN_POSITIONS} | "
+            f"SlotBudget=Rs{cfg.CAPITAL//cfg.MAX_OPEN_POSITIONS:,.0f} | "
+            f"TP=1.8x(chop)/2.5x(bull) | Target=Rs{getattr(cfg,'DAILY_TARGET',500):.0f}"
         )
         log.info("Scheduler running")
 
