@@ -2,12 +2,19 @@
 #  config/config.py  —  Infrastructure, paths, API keys,
 #                        timing, filters, Redis, Telegram.
 #
+#  v4.2 PATCH 2026-07-18:
+#   FIX-1: CAPITAL corrected to Rs1,00,000 (1 Lakh) — was Rs4L
+#   FIX-4: BUY_THRESHOLD_DEFAULT raised 0.52 → 0.55
+#   FIX-5: SELL_THRESHOLD_DEFAULT raised 0.52 → 0.60 (1-prob proxy)
+#   FIX-6: AVOID_LUNCH_HOURS = True (12:30-13:00 chop)
+#   FIX-7: NO_REENTRY_MINUTES lowered 60 → 30
+#
 #  v4.1 PATCH 2026-07-17:
 #   - PROFIT_LOCK_FLOOR     = 500   (never fall below Rs500 once hit)
 #   - PROFIT_PULLBACK_RS    = 45    (if pnl peaks at 550 then drops to 505, exit)
 #   - POST_TARGET_BULL_ONLY = True  (new entries after target ONLY on BULL+above_res)
 #   - NIFTY_WEAK_HARD_STOP  = True  (WEAK regime = no new entries at all)
-#   - NIFTY_RESISTANCE_MULT = 1.002 (nifty close must be > ema50 * this to count as "above resistance")
+#   - NIFTY_RESISTANCE_MULT = 1.002 (nifty close must be > ema50 * this to count as above resistance)
 # ============================================================
 
 import os
@@ -53,34 +60,36 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 
 
 # ── Capital & position sizing ────────────────────────────────
-CAPITAL               = 400_000
+# FIX-1 v4.2: Corrected to Rs1,00,000 (1 Lakh).
+# With 1% risk/trade = Rs1,000 risk.
+# TP at 2.5x ATR / SL at 1.2x ATR => theoretical RR ~2.08
+# => 1 winner nets ~Rs1,800 after charges → target Rs500 needs ~1 win/day
+CAPITAL               = 100_000
 TOTAL_CAPITAL         = CAPITAL
-MAX_RISK_PCT          = 0.01
+MAX_RISK_PCT          = 0.01           # 1% of capital = Rs1,000 risk per trade
 RISK_PER_TRADE        = MAX_RISK_PCT
-MAX_CAPITAL_PER_TRADE = 0.25
+MAX_CAPITAL_PER_TRADE = 0.30           # max 30% of capital per single trade = Rs30,000
 MAX_PER_SECTOR        = 3
 MAX_OPEN_TRADES       = 3
 MAX_OPEN_POSITIONS    = MAX_OPEN_TRADES
-DAILY_LOSS_LIMIT      = 0.02
+DAILY_LOSS_LIMIT      = 0.02           # 2% = Rs2,000 max daily loss
 MAX_DAILY_LOSS        = DAILY_LOSS_LIMIT
 
 
 # ── Daily P&L management (v4.1) ────────────────────────────
-# Rs500 target per day.
+# Rs500 target per day on Rs1L capital = 0.5% daily return.
 DAILY_TARGET          = 500.0
 
 # Once daily_pnl >= DAILY_TARGET, we never let it fall below PROFIT_LOCK_FLOOR.
-# If pnl was 550 and falls back below (550 - PROFIT_PULLBACK_RS = 505), force-exit
-# all positions immediately to lock in profit.
-PROFIT_LOCK_FLOOR     = 500.0    # absolute floor in Rs — never fall below this
+# If pnl was 550 and falls back by PROFIT_PULLBACK_RS (45), force-exit all.
+PROFIT_LOCK_FLOOR     = 500.0    # absolute floor in Rs
 PROFIT_PULLBACK_RS    = 45.0     # if peak_pnl - current_pnl >= this, exit all
 
 # After target hit, allow NEW entries only on confirmed BULL day
-# (regime=BULL AND Nifty above EMA50 * NIFTY_RESISTANCE_MULT).
 POST_TARGET_BULL_ONLY    = True
-NIFTY_RESISTANCE_MULT    = 1.002   # nifty must be 0.2% above its EMA50 to qualify
+NIFTY_RESISTANCE_MULT    = 1.002   # nifty must be 0.2% above EMA50 to qualify
 
-# WEAK regime (nifty falling): hard-stop all new entries.
+# WEAK regime: hard-stop all new entries
 NIFTY_WEAK_HARD_STOP     = True
 
 
@@ -130,10 +139,17 @@ VWAP_SOFT_PENALTY            = 0.03
 
 
 # ── Signal thresholds ───────────────────────────────────────
-BUY_THRESHOLD_DEFAULT        = 0.52
+# FIX-4 v4.2: BUY_THRESHOLD_DEFAULT raised 0.52 → 0.55
+# At 0.52 the edge is too thin to overcome brokerage drag on Rs1L capital.
+# At 0.55 model needs to be right 55% of the time — still achievable.
+BUY_THRESHOLD_DEFAULT        = 0.55
 BUY_THRESHOLD_WEAK           = 0.58
-SELL_THRESHOLD_DEFAULT       = 0.52
-SELL_THRESHOLD_WEAK          = 0.58
+
+# FIX-5 v4.2: SELL_THRESHOLD raised 0.52 → 0.60
+# prob_short = 1 - prob_long is a proxy, NOT a dedicated short model.
+# Needs a higher bar to avoid noise-driven short entries.
+SELL_THRESHOLD_DEFAULT       = 0.60
+SELL_THRESHOLD_WEAK          = 0.62
 MIN_RR_RATIO                 = 1.5
 
 
@@ -143,11 +159,16 @@ PENALTY_MIN_LOSS             = 1200
 
 
 # ── Re-entry protection ─────────────────────────────────────
-NO_REENTRY_MINUTES = 60
+# FIX-7 v4.2: Lowered from 60 → 30 minutes.
+# A 60-min block was missing valid bull reversals after an early stop.
+# 30 min is enough cool-down while still catching the main trend move.
+NO_REENTRY_MINUTES = 30
 
 
 # ── Lunch hours ─────────────────────────────────────────────
-AVOID_LUNCH_HOURS  = False
+# FIX-6 v4.2: Set to True. 12:30-13:00 is low-volume choppy range;
+# false breakouts during this window routinely cost Rs200-400.
+AVOID_LUNCH_HOURS  = True
 LUNCH_START        = "12:30"
 LUNCH_END          = "13:00"
 

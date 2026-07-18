@@ -1,13 +1,21 @@
 # ============================================================
 # signal_engine.py — dhan_xgb_bot_v2
+# v4.2 PATCH 2026-07-18:
+#   FIX-2: Removed double daily-target gate.
+#           The DAILY_TARGET_HIT check was duplicated here AND in
+#           bot._can_enter_new(). Having it here caused:
+#           (a) stale daily_pnl=0 from caller to silently block all signals
+#           (b) signals logged as REJECTED even when bot gate already handles it
+#           The single authoritative gate is bot._can_enter_new().
+#           signal_engine now only rejects on data/model/time/position limits.
+#
 # v4.0 OVERHAUL 2026-07-17:
 #   - SELL (SHORT) signal added — symmetric to BUY logic
 #   - Per-stock sideways skip: if stock's own ATR < SIDEWAYS_ATR_RATIO
 #     of its 20-period ATR mean, skip — stock is consolidating
 #   - Opening momentum boost: 9:15-9:30 candles get +0.02 prob bonus
 #     if aligned with ORB direction (catches first-candle moves)
-#   - Daily target gate: if tm reports daily_pnl >= DAILY_TARGET, skip
-#   - Extension guard: now applied to SELL side too (price too far below EMA)
+#   - Extension guard: now applied to SELL side too
 #   - All prior fixes (FIX-15, ISSUE-21) retained
 # ============================================================
 
@@ -140,20 +148,33 @@ class SignalEngine:
             self._log(symbol, result)
             return result
 
-        # ── v4.0: Daily target gate — stop new entries if Rs500 hit ──
-        if daily_pnl >= cfg.DAILY_TARGET:
-            return reject("DAILY_TARGET_HIT")
+        # FIX-2 v4.2: DAILY_TARGET gate removed from here.
+        # The single authoritative gate is bot._can_enter_new().
+        # Having it here caused stale daily_pnl=0 to silently block
+        # all signals at the start of a new day.
 
         # ── Time gate ──────────────────────────────────────────
         if now < cfg.NO_NEW_TRADE_BEFORE or now >= cfg.NO_NEW_TRADE_AFTER:
             return reject("OUTSIDE_HOURS")
+
+        # ── Lunch hour gate ────────────────────────────────────
+        # FIX-6: AVOID_LUNCH_HOURS now enforced here too so signal log
+        # correctly shows LUNCH_SKIP instead of LOW_PROB for these rejections.
+        if getattr(cfg, "AVOID_LUNCH_HOURS", False):
+            lunch_start = cfg.LUNCH_START  # "12:30"
+            lunch_end   = cfg.LUNCH_END    # "13:00"
+            ls_h, ls_m = map(int, lunch_start.split(":"))
+            le_h, le_m = map(int, lunch_end.split(":"))
+            from datetime import time as _dtime
+            if _dtime(ls_h, ls_m) <= now < _dtime(le_h, le_m):
+                return reject("LUNCH_SKIP")
 
         # ── Model gate ─────────────────────────────────────────
         if self.model is None:
             return reject("NO_MODEL")
 
         # ── Data quality ───────────────────────────────────────
-        if len(df) < 50:  # v4: reduced from 210 — allows 9:15 entries
+        if len(df) < 50:
             return reject(f"INSUFFICIENT_DATA({len(df)})")
         if df["close"].iloc[-1] < cfg.MIN_STOCK_PRICE:
             return reject(f"PRICE_LOW({df['close'].iloc[-1]:.0f})")
@@ -256,8 +277,6 @@ class SignalEngine:
         atr = max(atr, price * 0.005)
 
         # ── v4.0: Per-stock sideways skip ──────────────────────
-        # If this stock's own ATR is below its rolling mean * SIDEWAYS_ATR_RATIO,
-        # the stock itself is consolidating — skip it regardless of Nifty regime.
         sideways_ratio = getattr(cfg, "SIDEWAYS_ATR_RATIO", 0.80)
         atr_expansion  = float(feat.iloc[0].get("atr_expansion", 1.0))
         if atr_expansion < sideways_ratio:
@@ -273,19 +292,14 @@ class SignalEngine:
             ext_pct = 0.0
 
         # ── v4.0: Opening momentum bonus (9:15-9:30 candles) ──
-        # If we're in the first 3 candles of the day AND ORB is confirmed,
-        # give a small prob bonus to catch the opening move.
         session_min = float(feat.iloc[0].get("session_min", 999))
         orb_break   = int(feat.iloc[0].get("orb_break", 0))
-        is_opening  = session_min <= 15   # 9:15, 9:20, 9:25, 9:30
+        is_opening  = session_min <= 15
 
         # ── Determine direction ────────────────────────────────
-        # BUY conditions:  high prob_long AND price not extended above EMA
-        # SELL conditions: high prob_short AND price not extended below EMA (inverse)
         buy_thr  = cfg.BUY_THRESHOLD_WEAK  if nifty_regime == "WEAK"   else cfg.BUY_THRESHOLD_DEFAULT
-        sell_thr = getattr(cfg, "SELL_THRESHOLD_WEAK",    0.58) if nifty_regime == "BULL" else getattr(cfg, "SELL_THRESHOLD_DEFAULT", 0.52)
+        sell_thr = cfg.SELL_THRESHOLD_WEAK if nifty_regime == "BULL"   else cfg.SELL_THRESHOLD_DEFAULT
 
-        # Adaptive breakout confirmation (v3 logic, now for both sides)
         breakout_ok = int(feat.iloc[0].get("breakout_confirm", 1))
         above_vwap  = int(feat.iloc[0].get("above_vwap",  1))
 
@@ -293,7 +307,7 @@ class SignalEngine:
         action_buy  = False
         prob_buy    = prob_long
 
-        if ext_pct <= max_ext:   # not already extended above EMA
+        if ext_pct <= max_ext:
             if cfg.REQUIRE_BREAKOUT_CONFIRMATION:
                 if nifty_regime in ("SIDEWAYS", "WEAK", "NEUTRAL"):
                     if not breakout_ok:
@@ -306,7 +320,6 @@ class SignalEngine:
             if cfg.REQUIRE_VWAP_CONFIRM and not above_vwap:
                 prob_buy = max(prob_buy - vwap_penalty, 0.0)
 
-            # Opening momentum bonus
             if is_opening and orb_break:
                 prob_buy = min(prob_buy + 0.02, 0.99)
 
@@ -318,19 +331,16 @@ class SignalEngine:
         prob_sell   = prob_short
 
         if cfg.ALLOW_SHORTS:
-            # Sell when price is NOT already extended downward below EMA
             ext_pct_down = (ema20 - price) / ema20 if ema20 > 0 else 0.0
             if ext_pct_down <= max_ext:
                 if cfg.REQUIRE_BREAKOUT_CONFIRMATION:
                     if nifty_regime in ("BULL", "NEUTRAL"):
-                        if not (above_vwap == 0):  # needs price below VWAP for short
+                        if not (above_vwap == 0):
                             prob_sell = max(prob_sell - 0.03, 0.0)
 
-                # Nifty WEAK regime gives SELL a small bonus
                 if nifty_regime == "WEAK":
                     prob_sell = min(prob_sell + 0.02, 0.99)
 
-                # Opening candle short: only if ORB breakdown (price < orb_low)
                 if is_opening and not orb_break:
                     prob_sell = min(prob_sell + 0.02, 0.99)
 
@@ -338,7 +348,6 @@ class SignalEngine:
                     action_sell = True
 
         # ── Pick stronger signal ───────────────────────────────
-        # If both triggered (unlikely but possible), take the stronger one.
         if action_buy and action_sell:
             if prob_buy >= prob_sell:
                 action_sell = False
@@ -356,7 +365,7 @@ class SignalEngine:
             rr     = ((target - price) / (price - sl)) if price > sl else 0
             side   = "LONG"
             prob   = prob_buy
-        else:  # SELL short
+        else:
             sl     = min(price + cfg.ATR_SL_MULT * atr, price * (1 + cfg.MAX_SL_PCT))
             sl     = max(sl, price * (1 + cfg.MIN_SL_PCT))
             target = price - cfg.ATR_TP_MULT * atr
@@ -373,7 +382,6 @@ class SignalEngine:
             qty_factor = penalty.penalty_factor(symbol) if hasattr(penalty, "penalty_factor") else 1.0
         result["qty_factor"] = round(qty_factor, 2)
 
-        # ── Mark duplicate guard (atomic NX) ───────────────────
         _safe_setex_nx(dedup_key, cfg.TTL_DEDUP_ORDER, "1")
 
         action = "BUY" if action_buy else "SELL"

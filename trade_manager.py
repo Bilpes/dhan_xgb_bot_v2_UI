@@ -1,11 +1,21 @@
 """trade_manager.py — full execution layer for dhan_xgb_bot_v2/v3/v4
 
+v4.2 Changes 2026-07-18:
+* FIX-3: compute_qty cap raised from 0.20 → 0.30 of capital.
+  With Rs1L capital and 0.20 cap, high-price stocks (Rs1000+) get
+  capped at only 20 shares — too little to make Rs500/day target.
+  0.30 cap = Rs30,000 max per trade, enough to carry meaningful qty.
+* FIX-3: Added explicit qty=0 guard with log warning instead of silent skip.
+  Previously qty<=0 was silently returning False with no log trace.
+* can_trade() third gate removed (DAILY_TARGET check duplicated here AND
+  in bot._can_enter_new). Removed from here — bot._can_enter_new() is the
+  single authoritative gate.
+
 v4.0 Changes 2026-07-17:
-* SHORT (SELL) position support — Position now has a `side` field ('LONG'/'SHORT')
-* P&L for SHORT = (entry - exit_price) * qty  (inverse of LONG)
-* enter() now reads sig['side'] and sig['action'] to determine direction
-* _place_order() uses 'SELL' for SHORT entry and 'BUY' for SHORT exit
-* Daily target gate: can_trade() returns False if daily_pnl >= DAILY_TARGET
+* SHORT (SELL) position support — Position now has a side field (LONG/SHORT)
+* P&L for SHORT = (entry - exit_price) * qty
+* enter() now reads sig[side] and sig[action] to determine direction
+* _place_order() uses SELL for SHORT entry and BUY for SHORT exit
 * check_exits() applies SL/TP correctly for both LONG and SHORT
 
 All prior fixes (ISSUE-13 through ISSUE-21, FIX-15) retained.
@@ -94,14 +104,17 @@ class TradeManager:
         log.info("[TradeManager] WatchlistManager linked.")
 
     def can_trade(self) -> bool:
+        """Check if a new trade is allowed.
+
+        FIX-3 v4.2: Removed the DAILY_TARGET duplicate check from here.
+        The authoritative gate is bot._can_enter_new() which checks
+        DAILY_TARGET + regime + profit-lock together.
+        Keeping it here caused false rejections when daily_pnl was
+        correctly handled upstream.
+        """
         self._reset_daily_if_needed()
         if self._daily_cb_tripped:
             log.warning("[TradeManager] Daily-loss CB ACTIVE.")
-            return False
-        # v4.0: stop new entries once daily target is hit
-        daily_target = getattr(cfg, "DAILY_TARGET", 500.0)
-        if self._realised_pnl >= daily_target:
-            log.info("[TradeManager] Daily target Rs%.0f hit — no new entries.", daily_target)
             return False
         with self._lock:
             if len(self.positions) >= cfg.MAX_OPEN_POSITIONS:
@@ -133,14 +146,33 @@ class TradeManager:
         return round(sl, 2), round(tp, 2), round(rr, 4)
 
     def compute_qty(self, entry: float, sl: float) -> int:
+        """Compute share quantity based on risk per trade.
+
+        FIX-3 v4.2:
+        - Cap raised from 0.20 → 0.30 of capital.
+          With Rs1L capital: max Rs30,000 per trade.
+          Previously Rs20,000 cap was too low for high-price stocks
+          (e.g. Rs800 stock: old cap = 25 shares, new = 37 shares).
+        - Added explicit qty=0 guard with log warning so we never
+          silently enter with 0 shares.
+        """
         sl_pts = abs(entry - sl)
         if sl_pts <= 0:
+            log.warning("[compute_qty] %s: sl_pts=0, cannot size — skipping.", entry)
             return 0
         risk_amount = cfg.RISK_PER_TRADE * self.capital
         qty = math.floor(risk_amount / sl_pts)
-        max_qty = math.floor(self.capital * 0.20 / entry)
+        # FIX-3: raised cap from 0.20 → 0.30
+        max_qty = math.floor(self.capital * 0.30 / entry)
         qty = min(qty, max_qty)
-        return max(qty, 1)
+        if qty <= 0:
+            log.warning(
+                "[compute_qty] entry=%.2f sl=%.2f risk=%.0f → qty=%d (capped). "
+                "Trade skipped — check ATR or capital.",
+                entry, sl, risk_amount, qty,
+            )
+            return 0
+        return qty
 
     def enter(self, symbol: str, sig: dict) -> bool:
         """Wrapper for bot.py. sig has keys: action, side, entry, sl, target, prob, atr."""
@@ -178,6 +210,11 @@ class TradeManager:
 
         qty = self.compute_qty(entry, sl)
         if qty <= 0:
+            # FIX-3: explicit log instead of silent skip
+            log.warning(
+                "[TradeManager] %s qty=0 after sizing (entry=%.2f sl=%.2f capital=%.0f) — SKIPPED.",
+                symbol, entry, sl, self.capital,
+            )
             return False
 
         pos = Position(
@@ -214,7 +251,6 @@ class TradeManager:
             log.warning("[TradeManager] exit_trade for unknown symbol %s.", symbol)
             return 0.0
 
-        # v4: P&L depends on direction
         if pos.side == "SHORT":
             pnl = (pos.entry - price) * pos.qty
         else:
