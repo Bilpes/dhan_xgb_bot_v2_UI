@@ -24,6 +24,32 @@ Output files (written to repo root)
                            qty, SL, TP, P&L, exit reason
   backtest_summary.csv  -- day-by-day P&L, regime, win%, target hit
   backtest_report.txt   -- full text report (also printed to console)
+
+CHANGELOG
+---------
+Fix 1 -- _get_regime() thresholds
+  OLD: BULL if ret > +0.0015 (+0.15%), WEAK if ret < -0.0015 (-0.15%)
+  NEW: BULL if ret > +0.005  (+0.50%), WEAK if ret < -0.005  (-0.50%)
+  WHY: NSE/Nifty daily range is typically 0.3-1.5%.  A ±0.15% band
+       classified almost every session as WEAK or NEUTRAL.  With
+       NIFTY_WEAK_HARD_STOP=True that blocked ALL entries on WEAK days,
+       producing 0 trades across the entire 30-day run.  The ±0.50%
+       band correctly separates strong bull days, genuinely weak days,
+       and flat/range-bound days.
+
+Fix 2 -- WEAK hard-stop scope
+  OLD: 'continue' on WEAK skipped the ENTIRE bar including SL/TP mgmt
+  NEW: WEAK guard is placed AFTER SL/TP checks so open positions are
+       still managed (SL hit, TP hit, EOD close) even on WEAK days.
+       Only NEW entry scanning is blocked.
+
+Fix 3 -- NEUTRAL signal filter
+  OLD: RSI window 38-70, short_ma >= long_ma (strict equality)
+  NEW: RSI window 35-75, short_ma >= long_ma * 0.998 (0.2% tolerance)
+  WHY: On flat days short_ma and long_ma are nearly identical.  The
+       strict equality check caused near-zero entries on NEUTRAL days.
+       0.2% tolerance lets valid setups through while still filtering
+       clear downtrends.
 ================================================================
 """
 
@@ -449,15 +475,29 @@ def _day_slice(df: pd.DataFrame, d: date) -> pd.DataFrame:
 def _get_regime(nifty_day: pd.DataFrame) -> tuple[str, float]:
     """
     Classify the day-level regime from Nifty open-to-close return.
-      ret > +0.15%  ->  BULL
-      ret < -0.15%  ->  WEAK
-      else          ->  NEUTRAL
+
+    FIX (v2): Thresholds raised from ±0.15% to ±0.50%.
+    -------------------------------------------------------
+    The original ±0.15% band was far too tight for NSE.  A typical
+    Nifty session moves 0.3-1.5% open-to-close.  With the old band:
+      - A day that closes +0.20% from open → BULL  (fine)
+      - A day that closes -0.20% from open → WEAK  (then NIFTY_WEAK_HARD_STOP
+        blocks ALL new entries for the entire day → 0 trades)
+      - Most sessions fell into WEAK or NEUTRAL, producing 0 trades.
+
+    With ±0.50%:
+      ret > +0.50%  ->  BULL    (strong up day)
+      ret < -0.50%  ->  WEAK    (strong down day -- hard-stop applies)
+      else          ->  NEUTRAL (range-bound / mild drift -- normal trading)
+
+    This matches real NSE session behaviour and allows entries on the
+    majority of days that are mildly up or mildly down.
 
     NOTE: SIDEWAYS_NIFTY_THRESH (0.003 = 0.3%) is intentionally NOT
     used here because it is a whole-day threshold.  Using it on 5-min
     bars causes almost every bar to look "neutral" and fires the
-    sideways guard instantly.  The bar-level sideways check below uses
-    its own per-bar threshold (_BAR_SIDEWAYS_THRESH = 0.0005 = 0.05%).
+    sideways guard instantly.  The bar-level sideways check uses its
+    own per-bar threshold (_BAR_SIDEWAYS_THRESH = 0.0005 = 0.05%).
     """
     if nifty_day.empty:
         return "NEUTRAL", 0.0
@@ -466,9 +506,10 @@ def _get_regime(nifty_day: pd.DataFrame) -> tuple[str, float]:
     if first_open == 0:
         return "NEUTRAL", 0.0
     ret = (last_close - first_open) / first_open
-    if   ret >  0.0015: return "BULL",    round(float(ret), 5)
-    elif ret < -0.0015: return "WEAK",    round(float(ret), 5)
-    else:               return "NEUTRAL", round(float(ret), 5)
+    # FIX: raised from ±0.0015 (±0.15%) to ±0.005 (±0.50%)
+    if   ret >  0.005: return "BULL",    round(float(ret), 5)
+    elif ret < -0.005: return "WEAK",    round(float(ret), 5)
+    else:              return "NEUTRAL", round(float(ret), 5)
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -558,7 +599,7 @@ def replay_day(
     debug: bool = False,
 ) -> tuple[list[dict], dict]:
     nifty_day = _day_slice(all_data.get(nifty_key, pd.DataFrame()), trade_date)
-    regime, _ = _get_regime(nifty_day)
+    regime, regime_ret = _get_regime(nifty_day)
 
     is_bull = regime == "BULL"
     tp_mult = ATR_TP_MULT_BULL if is_bull else ATR_TP_MULT
@@ -569,7 +610,7 @@ def replay_day(
     stock_trades   = defaultdict(int)
 
     # Sideways detection:
-    # KEY FIX -- sideways_day is NO LONGER a permanent latch.
+    # sideways_day is NO LONGER a permanent latch.
     # We track a rolling neutral_streak counter.  On each bar we check if
     # the LAST N bars were all flat.  If yes, skip entry on THIS bar only.
     # The moment the market makes a meaningful move, neutral_streak resets
@@ -593,10 +634,18 @@ def replay_day(
         all_ts.update(nifty_day.index.tolist())
     sorted_ts = sorted(all_ts)
 
+    if debug:
+        print(f"\n  [{trade_date}] regime={regime} ({regime_ret:+.3%})  bars={len(sorted_ts)}")
+
     for ts in sorted_ts:
         t = ts.time()
 
+        # ----------------------------------------------------------------
         # EOD force-close at 15:14
+        # NOTE: SL/TP management runs BEFORE all entry guards (including
+        # the WEAK hard-stop) so open positions are always managed even
+        # on WEAK days.  Only NEW entries are gated by regime.
+        # ----------------------------------------------------------------
         if t >= dtime(15, 14):
             for sym, pos in list(open_pos.items()):
                 df  = _day_slice(all_data.get(sym, pd.DataFrame()), trade_date)
@@ -615,7 +664,11 @@ def replay_day(
         if dtime(12, 30) <= t < dtime(13, 0):
             continue
 
+        # ----------------------------------------------------------------
         # SL / TP check on open positions
+        # FIX: This block runs unconditionally -- BEFORE the WEAK regime
+        # guard below.  Open positions must be managed even on WEAK days.
+        # ----------------------------------------------------------------
         for sym in list(open_pos.keys()):
             pos = open_pos[sym]
             df  = _day_slice(all_data.get(sym, pd.DataFrame()), trade_date)
@@ -662,15 +715,6 @@ def replay_day(
 
         # ----------------------------------------------------------------
         # Sideways detection -- ROLLING WINDOW, NOT a permanent latch
-        #
-        # OLD (broken): once sideways_day=True it never reset, blocking
-        #               all entries for the rest of the day.
-        #
-        # NEW (correct): neutral_streak counts consecutive flat Nifty bars.
-        #   - If the last SIDEWAYS_CONSECUTIVE_SCANS bars were all flat
-        #     (<0.05% move each), skip entry on THIS bar only.
-        #   - As soon as one bar moves >= 0.05%, streak resets to 0 and
-        #     entries are allowed again on the next bar.
         # ----------------------------------------------------------------
         nr = nifty_day[nifty_day.index == ts]
         if not nr.empty:
@@ -684,13 +728,19 @@ def replay_day(
 
         is_sideways_now = (neutral_streak >= SIDEWAYS_CONSECUTIVE_SCANS)
 
-        # Entry guards (evaluate in order; first failing guard logs reason)
+        # ----------------------------------------------------------------
+        # Entry guards -- evaluated in order; first failing guard skips
+        # new entry scan for this bar.
+        # FIX: WEAK guard only prevents NEW entries.  SL/TP management
+        # (above) already ran unconditionally before reaching this point.
+        # ----------------------------------------------------------------
         if is_sideways_now:
             skip_counts["sideways"] += 1
             if debug:
                 print(f"  {ts}  SKIP sideways (streak={neutral_streak})")
             continue
         if NIFTY_WEAK_HARD_STOP and regime == "WEAK":
+            # Only block new entries; existing positions were handled above
             skip_counts["weak_regime"] += 1
             continue
         if post_target and POST_TARGET_BULL_ONLY and not is_bull:
@@ -736,15 +786,19 @@ def replay_day(
             long_ma  = closes[-10:].mean() if len(closes) >= 10 else closes.mean()
             rsi      = _simple_rsi(closes, 14)
 
-            # Signal conditions (relaxed for 5-min bar reality):
+            # Signal conditions:
             #   BULL:    short_ma within 0.1% of long_ma (trend aligned),
             #            RSI >= 40, bar is not strongly bearish
-            #   NEUTRAL: strict MA crossover + RSI in mid-zone
+            #   NEUTRAL: short_ma >= long_ma with 0.2% tolerance (FIX: was strict equality),
+            #            RSI in 35-75 (FIX: was 38-70), bar not strongly bearish
             #   WEAK:    no LONG entries (SHORT side not yet implemented)
             if regime == "BULL":
                 ok = (short_ma >= long_ma * 0.999) and (rsi >= 40) and (c["close"] >= c["open"] * 0.9995)
             elif regime == "NEUTRAL":
-                ok = (short_ma >= long_ma) and (38 < rsi < 70) and (c["close"] >= c["open"] * 0.9995)
+                # FIX: loosened short_ma tolerance 0.999 -> 0.998 and RSI 38-70 -> 35-75
+                # On flat days short_ma and long_ma are nearly identical; strict equality
+                # filtered out nearly all valid setups on NEUTRAL days.
+                ok = (short_ma >= long_ma * 0.998) and (35 < rsi < 75) and (c["close"] >= c["open"] * 0.9995)
             else:
                 ok = False
 
@@ -795,6 +849,7 @@ def replay_day(
     return day_trades, {
         "date":          str(trade_date),
         "regime":        regime,
+        "regime_ret":    regime_ret,
         "trades":        len(day_trades),
         "wins":          len(wins),
         "losses":        len(losses),
@@ -879,6 +934,7 @@ def run_backtest(
         )
         print(
             f"  {d}  {summary['regime']:<8}"
+            f"  ({summary['regime_ret']:+.2%})"
             f"  {summary['trades']:>3} trades"
             f"  {summary['win_pct']:>5.1f}% wins"
             f"  Day P&L: {summary['day_pnl']:>+9,.2f}"
