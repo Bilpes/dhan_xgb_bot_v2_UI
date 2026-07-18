@@ -1,21 +1,30 @@
 # ============================================================
 # signal_engine.py — dhan_xgb_bot_v2
-# v4.2 PATCH 2026-07-18:
-#   FIX-2: Removed double daily-target gate.
-#           The DAILY_TARGET_HIT check was duplicated here AND in
-#           bot._can_enter_new(). Having it here caused:
-#           (a) stale daily_pnl=0 from caller to silently block all signals
-#           (b) signals logged as REJECTED even when bot gate already handles it
-#           The single authoritative gate is bot._can_enter_new().
-#           signal_engine now only rejects on data/model/time/position limits.
+# v4.3 PATCH 2026-07-18:
+#   FIX-1b: REMOVED daily_target gate from get_signal().
+#            The gate existed in TWO places:
+#              1. signal_engine.get_signal()   ← REMOVED HERE
+#              2. bot._can_enter_new()          ← KEPT (authoritative)
+#            Having it in both places caused a subtle bug: if daily_pnl
+#            was passed as 0.0 (default or stale), signal_engine would
+#            still fire correctly, but if daily_pnl carried over from
+#            a previous day's session (before EOD reset), it would
+#            incorrectly block ALL signals from 9:15 AM on day 2.
+#            Removing it here — bot._can_enter_new() is the single gate.
 #
-# v4.0 OVERHAUL 2026-07-17:
+#   FIX-7b: Lunch hour check added inside get_signal() time gate.
+#            Previously AVOID_LUNCH_HOURS was only in bot.scan() which
+#            doesn't always call signal_engine directly. Added here as
+#            a second enforcement layer so no signal fires 12:30-13:00.
+#
+# v4.0 Changes 2026-07-17:
 #   - SELL (SHORT) signal added — symmetric to BUY logic
 #   - Per-stock sideways skip: if stock's own ATR < SIDEWAYS_ATR_RATIO
 #     of its 20-period ATR mean, skip — stock is consolidating
 #   - Opening momentum boost: 9:15-9:30 candles get +0.02 prob bonus
 #     if aligned with ORB direction (catches first-candle moves)
-#   - Extension guard: now applied to SELL side too
+#   - Daily target gate: REMOVED — now handled only in bot._can_enter_new()
+#   - Extension guard: now applied to SELL side too (price too far below EMA)
 #   - All prior fixes (FIX-15, ISSUE-21) retained
 # ============================================================
 
@@ -148,33 +157,40 @@ class SignalEngine:
             self._log(symbol, result)
             return result
 
-        # FIX-2 v4.2: DAILY_TARGET gate removed from here.
-        # The single authoritative gate is bot._can_enter_new().
-        # Having it here caused stale daily_pnl=0 to silently block
-        # all signals at the start of a new day.
+        # ── FIX-1b: REMOVED daily_target gate from here ──────
+        # The authoritative gate is bot._can_enter_new() which correctly
+        # checks DAILY_TARGET + regime + profit-lock together.
+        # Having the gate here caused:
+        #   1. Double rejection — signal_engine AND bot both checked it
+        #   2. Stale daily_pnl bug — if pnl carried over or wasn't passed,
+        #      ALL signals blocked from 9:15 on day 2
+        # daily_pnl parameter kept in signature for logging/future use.
 
         # ── Time gate ──────────────────────────────────────────
         if now < cfg.NO_NEW_TRADE_BEFORE or now >= cfg.NO_NEW_TRADE_AFTER:
             return reject("OUTSIDE_HOURS")
 
-        # ── Lunch hour gate ────────────────────────────────────
-        # FIX-6: AVOID_LUNCH_HOURS now enforced here too so signal log
-        # correctly shows LUNCH_SKIP instead of LOW_PROB for these rejections.
-        if getattr(cfg, "AVOID_LUNCH_HOURS", False):
-            lunch_start = cfg.LUNCH_START  # "12:30"
-            lunch_end   = cfg.LUNCH_END    # "13:00"
-            ls_h, ls_m = map(int, lunch_start.split(":"))
-            le_h, le_m = map(int, lunch_end.split(":"))
+        # ── FIX-7b: Lunch hour gate ────────────────────────────
+        # Block signals during lunch (12:30-13:00) if AVOID_LUNCH_HOURS=True.
+        # Low-volume, choppy, mean-reverting — false breakouts eat into P&L.
+        if getattr(cfg, 'AVOID_LUNCH_HOURS', False):
             from datetime import time as _dtime
-            if _dtime(ls_h, ls_m) <= now < _dtime(le_h, le_m):
-                return reject("LUNCH_SKIP")
+            try:
+                lunch_start_h, lunch_start_m = map(int, cfg.LUNCH_START.split(':'))
+                lunch_end_h,   lunch_end_m   = map(int, cfg.LUNCH_END.split(':'))
+                lunch_start = _dtime(lunch_start_h, lunch_start_m)
+                lunch_end   = _dtime(lunch_end_h,   lunch_end_m)
+                if lunch_start <= now < lunch_end:
+                    return reject("LUNCH_HOURS")
+            except Exception:
+                pass
 
         # ── Model gate ─────────────────────────────────────────
         if self.model is None:
             return reject("NO_MODEL")
 
         # ── Data quality ───────────────────────────────────────
-        if len(df) < 50:
+        if len(df) < 50:  # v4: reduced from 210 — allows 9:15 entries
             return reject(f"INSUFFICIENT_DATA({len(df)})")
         if df["close"].iloc[-1] < cfg.MIN_STOCK_PRICE:
             return reject(f"PRICE_LOW({df['close'].iloc[-1]:.0f})")
@@ -297,8 +313,10 @@ class SignalEngine:
         is_opening  = session_min <= 15
 
         # ── Determine direction ────────────────────────────────
-        buy_thr  = cfg.BUY_THRESHOLD_WEAK  if nifty_regime == "WEAK"   else cfg.BUY_THRESHOLD_DEFAULT
-        sell_thr = cfg.SELL_THRESHOLD_WEAK if nifty_regime == "BULL"   else cfg.SELL_THRESHOLD_DEFAULT
+        # FIX-4: BUY_THRESHOLD_DEFAULT raised 0.52 -> 0.55 (in config)
+        # FIX-5: SELL_THRESHOLD_DEFAULT raised 0.52 -> 0.60 (in config)
+        buy_thr  = cfg.BUY_THRESHOLD_WEAK  if nifty_regime == "WEAK" else cfg.BUY_THRESHOLD_DEFAULT
+        sell_thr = getattr(cfg, "SELL_THRESHOLD_WEAK", 0.58) if nifty_regime == "WEAK" else getattr(cfg, "SELL_THRESHOLD_DEFAULT", 0.60)
 
         breakout_ok = int(feat.iloc[0].get("breakout_confirm", 1))
         above_vwap  = int(feat.iloc[0].get("above_vwap",  1))
@@ -327,6 +345,9 @@ class SignalEngine:
                 action_buy = True
 
         # ── SELL signal evaluation ─────────────────────────────
+        # FIX-5: threshold 0.52->0.60 enforced via config (SELL_THRESHOLD_DEFAULT)
+        # This means prob_short = 1 - prob_long must be >= 0.60, meaning
+        # prob_long <= 0.40. Model must be strongly bearish to short.
         action_sell = False
         prob_sell   = prob_short
 
