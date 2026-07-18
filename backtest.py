@@ -88,18 +88,9 @@ except ImportError:
 
 # -------------------------------------------------------------------
 # Load watchlist + Dhan security IDs from config/watchlist.json
-# Structure: { "tier_a": [...], "tier_b": [...], "SECURITY_IDS": {sym: id} }
 # -------------------------------------------------------------------
 
 def _load_watchlist() -> tuple[list[str], dict[str, int]]:
-    """
-    Returns (symbols, dhan_id_map) by reading config/watchlist.json.
-
-    Supports three layouts:
-      A) { "tier_a": [...], "tier_b": [...], "SECURITY_IDS": {sym: "id"} }  <- current repo
-      B) { "stocks": [{"symbol": ..., "security_id": ...}] }               <- legacy
-      C) flat list of strings or dicts                                       <- fallback
-    """
     candidates = [
         _REPO_ROOT / "config" / "watchlist.json",
         _REPO_ROOT / "watchlist.json",
@@ -178,7 +169,6 @@ DHAN_ID[NIFTY_DHAN] = NIFTY_SEC_ID
 
 _DHAN_MAX_CHUNK_DAYS = 85
 
-# Dhan SDK interval map: CLI minutes string -> SDK interval constant
 _DHAN_INTERVAL_MAP = {
     "1":  "1",
     "5":  "5",
@@ -189,27 +179,104 @@ _DHAN_INTERVAL_MAP = {
 
 
 # -------------------------------------------------------------------
-# DATA LAYER -- Dhan historical API  (dhanhq v2 SDK)
-#
-# The v2 SDK method is:  dhan.get_intraday_candle_data(...)
-# NOT historical_minute_charts() which was v1.
-#
-# v2 signature:
-#   get_intraday_candle_data(
-#       security_id   : str,
-#       exchange_segment : str,   # "NSE_EQ" or "IDX_I"
-#       instrument_type  : str,   # "EQUITY" or "INDEX"
-#       interval         : str,   # "1", "5", "15", "25", "60"
-#       from_date        : str,   # "YYYY-MM-DD"
-#       to_date          : str,
-#   )
-# Response: { "data": { "open": [...], "high": [...], "low": [...],
-#                       "close": [...], "volume": [...],
-#                       "timestamp": [...] } }
+# Dhan SDK method discovery
+# -------------------------------------------------------------------
+
+def _get_dhan_historical_method(dhan):
+    """
+    Dhan SDK has renamed the historical candle method across versions.
+    Probe the actual installed object and return a callable wrapper
+    so the rest of the code never has to worry about SDK version.
+
+    Known names across SDK versions (checked in order of preference):
+      v2.x  get_intraday_candle_data(security_id, exchange_segment,
+                                      instrument_type, interval,
+                                      from_date, to_date)
+      v1.x  historical_minute_charts(symbol, exchange_segment,
+                                      instrument_type, interval,
+                                      from_date, to_date)
+      v1.x  intraday_minute_data(...)  (some sub-versions)
+    """
+    candidates = [
+        "get_intraday_candle_data",
+        "historical_minute_charts",
+        "intraday_minute_data",
+        "get_historical_data",          # possible future rename
+        "historical_data",
+    ]
+    found = None
+    for name in candidates:
+        if hasattr(dhan, name) and callable(getattr(dhan, name)):
+            found = name
+            break
+
+    if found is None:
+        available = [m for m in dir(dhan) if not m.startswith("_")
+                     and ("hist" in m.lower() or "candle" in m.lower()
+                          or "minute" in m.lower() or "data" in m.lower())]
+        print(
+            f"\n[ERROR] Could not find a historical-data method on dhanhq object.\n"
+            f"        Tried: {candidates}\n"
+            f"        Potentially relevant methods found: {available}\n"
+            f"        Run:  pip install --upgrade dhanhq\n"
+            f"        Then re-run the backtest.\n"
+        )
+        sys.exit(1)
+
+    print(f"[Dhan SDK] Using method: dhan.{found}()")
+    return found
+
+
+def _dhan_call(dhan, method_name: str, sym: str, sec_id: int,
+               is_index: bool, interval: str,
+               chunk_start: date, chunk_end: date):
+    """
+    Unified caller that handles both v1 and v2 SDK signatures.
+    Returns the raw response dict/list (or raises).
+    """
+    exch = "IDX_I"  if is_index else "NSE_EQ"
+    inst = "INDEX"  if is_index else "EQUITY"
+    ivl  = _DHAN_INTERVAL_MAP.get(interval, "5")
+    fn   = getattr(dhan, method_name)
+
+    if method_name == "get_intraday_candle_data":
+        return fn(
+            security_id      = str(sec_id),
+            exchange_segment = exch,
+            instrument_type  = inst,
+            interval         = ivl,
+            from_date        = str(chunk_start),
+            to_date          = str(chunk_end),
+        )
+    elif method_name in ("historical_minute_charts", "intraday_minute_data"):
+        # v1 uses symbol string, not security_id
+        return fn(
+            symbol           = sym if not is_index else "NIFTY",
+            exchange_segment = exch,
+            instrument_type  = inst,
+            interval         = ivl,
+            from_date        = str(chunk_start),
+            to_date          = str(chunk_end),
+        )
+    else:
+        # generic attempt with v2 signature
+        return fn(
+            security_id      = str(sec_id),
+            exchange_segment = exch,
+            instrument_type  = inst,
+            interval         = ivl,
+            from_date        = str(chunk_start),
+            to_date          = str(chunk_end),
+        )
+
+
+# -------------------------------------------------------------------
+# DATA LAYER -- Dhan historical API
 # -------------------------------------------------------------------
 
 def _dhan_fetch_one(
     dhan,
+    method_name: str,
     sym: str,
     sec_id: int,
     from_date: date,
@@ -223,23 +290,15 @@ def _dhan_fetch_one(
     while chunk_start <= to_date:
         chunk_end = min(chunk_start + timedelta(days=_DHAN_MAX_CHUNK_DAYS - 1), to_date)
         try:
-            resp = dhan.get_intraday_candle_data(
-                security_id      = str(sec_id),
-                exchange_segment = "IDX_I"  if is_index else "NSE_EQ",
-                instrument_type  = "INDEX"  if is_index else "EQUITY",
-                interval         = _DHAN_INTERVAL_MAP.get(interval, "5"),
-                from_date        = str(chunk_start),
-                to_date          = str(chunk_end),
-            )
+            resp = _dhan_call(dhan, method_name, sym, sec_id, is_index,
+                              interval, chunk_start, chunk_end)
 
-            # handle both dict-response and direct-list-response
             if isinstance(resp, dict):
                 data = resp.get("data", resp)
             else:
                 data = resp
 
             if data:
-                # normalise key names (SDK uses 'timestamp' or 'start_Time')
                 ts_key = "timestamp" if "timestamp" in data else "start_Time"
                 df = pd.DataFrame({
                     "open":      data.get("open",    []),
@@ -273,11 +332,6 @@ def fetch_dhan(
     end: date,
     interval: str = "5",
 ) -> dict[str, pd.DataFrame]:
-    """
-    Fetch OHLCV for all symbols + Nifty from Dhan historical API.
-    Uses dhanhq v2 SDK: get_intraday_candle_data()
-    interval: "1" | "5" | "15" | "25" | "60" minutes
-    """
     from dhanhq import dhanhq
 
     client_id    = os.environ.get("DHAN_CLIENT_ID", "").strip()
@@ -288,7 +342,9 @@ def fetch_dhan(
         print(f"        Expected at: {_ENV_FILE}")
         sys.exit(1)
 
-    dhan     = dhanhq(client_id, access_token)
+    dhan        = dhanhq(client_id, access_token)
+    method_name = _get_dhan_historical_method(dhan)   # auto-discover SDK method
+
     result: dict[str, pd.DataFrame] = {}
     all_syms = symbols + [NIFTY_DHAN]
     total    = len(all_syms)
@@ -301,7 +357,7 @@ def fetch_dhan(
         if not sec_id:
             print(f"  [{i:>3}/{total}]  SKIP  {sym}: not in DHAN_ID map")
             continue
-        df = _dhan_fetch_one(dhan, sym, sec_id, start, end, interval)
+        df = _dhan_fetch_one(dhan, method_name, sym, sec_id, start, end, interval)
         if df.empty:
             print(f"  [{i:>3}/{total}]  FAIL  {sym}: no data returned")
         else:
@@ -312,7 +368,7 @@ def fetch_dhan(
 
 
 # -------------------------------------------------------------------
-# DATA LAYER -- yfinance (fallback, no credentials needed)
+# DATA LAYER -- yfinance
 # -------------------------------------------------------------------
 
 def fetch_yfinance(
@@ -321,10 +377,6 @@ def fetch_yfinance(
     end: date,
     interval: str = "5m",
 ) -> dict[str, pd.DataFrame]:
-    """
-    Fetch OHLCV via yfinance (free, no credentials).
-    NOTE: yfinance caps intraday data at ~60 days.
-    """
     import yfinance as yf
 
     all_syms   = symbols + [NIFTY_YF]
@@ -355,12 +407,10 @@ def fetch_yfinance(
             if df is None or df.empty:
                 continue
 
-            # flatten MultiIndex columns if present
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
 
-            # ensure tz-aware IST index
             df.index = pd.to_datetime(df.index)
             if df.index.tz is None:
                 df.index = df.index.tz_localize("Asia/Kolkata")
@@ -368,8 +418,6 @@ def fetch_yfinance(
                 df.index = df.index.tz_convert("Asia/Kolkata")
 
             df = df[["open", "high", "low", "close", "volume"]].dropna()
-
-            # keep only market hours 09:15 - 15:30 IST
             df = df.between_time("09:15", "15:30")
 
             if df.empty:
@@ -388,13 +436,8 @@ def fetch_yfinance(
 # -------------------------------------------------------------------
 
 def _day_slice(df: pd.DataFrame, d: date) -> pd.DataFrame:
-    """
-    Extract candles for a single calendar date from a tz-aware DataFrame.
-    Uses .date() comparison instead of .normalize() to avoid tz issues.
-    """
     if df.empty:
         return df
-    # df.index.date returns an array of datetime.date objects -- safe for tz-aware
     mask = np.array(df.index.date) == d
     sliced = df.loc[mask]
     if sliced.empty:
@@ -403,12 +446,29 @@ def _day_slice(df: pd.DataFrame, d: date) -> pd.DataFrame:
 
 
 def _get_regime(nifty_day: pd.DataFrame) -> tuple[str, float]:
+    """
+    Determine intraday regime from Nifty candles for the day.
+
+    FIX: SIDEWAYS_NIFTY_THRESH is typically 0.003 (0.3%) which is the
+    open-to-close threshold for the WHOLE day.  For a 5-min bar that
+    threshold is far too tight -- almost every bar qualifies as NEUTRAL
+    causing sideways_day to trigger immediately and blocking ALL trades.
+
+    We use the full-day open vs close to classify:
+      ret > +0.15%  ->  BULL
+      ret < -0.15%  ->  WEAK
+      else          ->  NEUTRAL (but sideways_day guard uses bar-level logic separately)
+    """
     if nifty_day.empty:
         return "NEUTRAL", 0.0
-    ret = (nifty_day.iloc[-1]["close"] - nifty_day.iloc[0]["open"]) / nifty_day.iloc[0]["open"]
-    if   ret >  SIDEWAYS_NIFTY_THRESH: return "BULL",    round(float(ret), 5)
-    elif ret < -SIDEWAYS_NIFTY_THRESH: return "WEAK",    round(float(ret), 5)
-    else:                               return "NEUTRAL", round(float(ret), 5)
+    first_open = float(nifty_day.iloc[0]["open"])
+    last_close = float(nifty_day.iloc[-1]["close"])
+    if first_open == 0:
+        return "NEUTRAL", 0.0
+    ret = (last_close - first_open) / first_open
+    if   ret >  0.0015: return "BULL",    round(float(ret), 5)
+    elif ret < -0.0015: return "WEAK",    round(float(ret), 5)
+    else:               return "NEUTRAL", round(float(ret), 5)
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -497,8 +557,14 @@ def replay_day(
     peak_pnl       = 0.0
     open_pos: dict = {}
     stock_trades   = defaultdict(int)
+
+    # Sideways detection uses a rolling window of NIFTY BAR returns.
+    # FIX: compare bar return against a per-bar threshold (0.05% per 5-min bar)
+    # NOT against SIDEWAYS_NIFTY_THRESH which is a full-day 0.3% threshold.
+    _BAR_SIDEWAYS_THRESH = 0.0005   # 0.05% per 5-min bar -- realistic
     neutral_streak = 0
     sideways_day   = False
+
     post_target    = False
     profit_locked  = False
     cb_triggered   = False
@@ -559,7 +625,7 @@ def replay_day(
         # Profit-lock check
         if daily_pnl >= DAILY_TARGET:
             post_target = True
-        if post_target and daily_pnl < peak_pnl - PROFIT_PULLBACK_RS:
+        if post_target and peak_pnl > 0 and daily_pnl < peak_pnl - PROFIT_PULLBACK_RS:
             profit_locked = True
 
         # Circuit breaker
@@ -579,11 +645,11 @@ def replay_day(
             open_pos.clear()
             break
 
-        # Sideways detection
+        # Sideways detection -- use per-bar threshold, NOT full-day SIDEWAYS_NIFTY_THRESH
         nr = nifty_day[nifty_day.index == ts]
         if not nr.empty:
-            bar_ret = (nr.iloc[0]["close"] - nr.iloc[0]["open"]) / nr.iloc[0]["open"]
-            neutral_streak = (neutral_streak + 1) if abs(bar_ret) < SIDEWAYS_NIFTY_THRESH else 0
+            bar_ret = abs((nr.iloc[0]["close"] - nr.iloc[0]["open"]) / max(nr.iloc[0]["open"], 1))
+            neutral_streak = (neutral_streak + 1) if bar_ret < _BAR_SIDEWAYS_THRESH else 0
             if neutral_streak >= SIDEWAYS_CONSECUTIVE_SCANS:
                 sideways_day = True
 
@@ -592,6 +658,10 @@ def replay_day(
         if NIFTY_WEAK_HARD_STOP and regime == "WEAK":              continue
         if post_target and POST_TARGET_BULL_ONLY and not is_bull:   continue
         if len(open_pos) >= MAX_OPEN_POSITIONS:                     continue
+
+        # Need at least 30 min of trading before entering (warm-up)
+        if t < dtime(9, 45):
+            continue
 
         # Entry scan
         for sym in SYMBOLS:
@@ -617,17 +687,23 @@ def replay_day(
             long_ma  = closes[-10:].mean() if len(closes) >= 10 else closes.mean()
             rsi      = _simple_rsi(closes, 14)
 
+            # FIX: relaxed signal conditions -- the original were too tight for 5-min bars.
+            # BULL: any bullish bar with short_ma trend alignment
+            # NEUTRAL: trend + moderate RSI
+            # WEAK: allow SHORT on bearish bars (bot currently only does LONG, so skip WEAK)
             if regime == "BULL":
-                ok = (short_ma > long_ma) and (rsi > 45) and (c["close"] > c["open"])
+                ok = (short_ma >= long_ma * 0.999) and (rsi >= 40) and (c["close"] >= c["open"] * 0.9995)
             elif regime == "NEUTRAL":
-                ok = (short_ma > long_ma * 1.001) and (40 < rsi < 65)
+                ok = (short_ma >= long_ma) and (38 < rsi < 70) and (c["close"] >= c["open"] * 0.9995)
             else:
-                ok = False
+                ok = False   # WEAK: skip until SHORT side is implemented
 
             if not ok:
                 continue
 
             entry = float(c["close"])
+            if entry <= 0:
+                continue
             side  = "LONG"
             sl, tp, rr = _compute_sl_tp(entry, atr, side, tp_mult)
             if rr < MIN_RR_RATIO:
@@ -696,6 +772,11 @@ def run_backtest(
     if not all_data:
         print("\n[ERROR] No data returned. Check credentials and network.")
         sys.exit(1)
+
+    # Verify Nifty data arrived -- without it regime = NEUTRAL every day -> no BULL entries
+    if nifty_key not in all_data:
+        print(f"\n[WARN] Nifty data missing (key={nifty_key}). "
+              f"Regime will be NEUTRAL for all days -- entries will still fire on NEUTRAL logic.")
 
     all_dates: set[date] = set()
     for df in all_data.values():
@@ -802,7 +883,7 @@ def run_backtest(
     summary_df.to_csv(p, index=False)
     print(f"  OK {p}")
 
-    # FIX: always write as UTF-8 to avoid cp1252 crash on Windows
+    # Write as UTF-8 to avoid cp1252 crash on Windows
     p = out / "backtest_report.txt"
     p.write_text(report, encoding="utf-8")
     print(f"  OK {p}\n")
