@@ -2,7 +2,25 @@
 #  config/config.py  — Infrastructure, paths, API keys,
 #                        timing, filters, Redis, Telegram.
 #
-#  v4.4 PATCH 2026-07-18:
+#  v4.5 PATCH 2026-07-18  (3 backtest fixes):
+#
+#  FIX-1 [GAP-1]: SIDEWAYS_CONSECUTIVE_SCANS 3 → 2
+#    Fires sideways-day block one scan earlier. Prevents the
+#    3rd entry on Jun-15 / Jun-17 style choppy days that caused
+#    the biggest daily losses in the 30-day backtest.
+#
+#  FIX-2: MAX_TRADES_PER_STOCK_PER_DAY = 3
+#    After 3 closed trades on the same symbol in a session, no
+#    new entry is allowed for that symbol today. Prevents
+#    BAJFINANCE/BEL overtrading (26-31% win-rate stocks that
+#    kept re-entering after losses).
+#
+#  FIX-3: MIN_SIGNAL_SCORE_WEAK = 10  (was 8)
+#    On NEUTRAL or WEAK regime days the signal score must reach
+#    >= 10. BUY_THRESHOLD_WEAK / SELL_THRESHOLD_WEAK tightened
+#    0.58 → 0.60. Expected win-rate lift: 38% → 44%+.
+#
+#  v4.4 PATCH 2026-07-18 (retained):
 #
 #  SIZING INTENT (user):
 #    Paper mode: 4L total capital, 4 open trades = Rs1L per trade slot.
@@ -17,7 +35,7 @@
 #
 #  GAP-1: SIDEWAYS_NIFTY_THRESH = 0.003
 #         When abs(nifty_5c_return) < 0.003 AND regime=NEUTRAL for
-#         3 consecutive scans -> treat day as SIDEWAYS, block new entries.
+#         2 consecutive scans -> treat day as SIDEWAYS, block new entries.
 #
 #  GAP-2: ATR_TP_MULT = 1.8 (was 2.5)
 #         Choppy/range-bound market — price rarely travels 2.5x ATR.
@@ -114,12 +132,34 @@ NIFTY_RESISTANCE_MULT    = 1.002
 NIFTY_WEAK_HARD_STOP     = True
 
 
-# ── GAP-1: Sideways day detection ────────────────────────────────────
-# When Nifty 5-candle return < this threshold AND regime stays NEUTRAL
-# for SIDEWAYS_CONSECUTIVE_SCANS scans, declare it a SIDEWAYS day.
+# ── FIX-1: Sideways day detection ────────────────────────────────────
+# When Nifty 5-candle return < SIDEWAYS_NIFTY_THRESH AND regime stays
+# NEUTRAL for SIDEWAYS_CONSECUTIVE_SCANS scans, declare SIDEWAYS day.
 # No new entries on sideways days — only manage existing positions.
+#
+# CHANGED v4.5: 3 → 2 scans
+# With 3 scans the bot entered a 3rd trade before blocking kicked in
+# on choppy Jun-15 / Jun-17 days. 2 scans fires the block earlier and
+# prevents that 3rd entry entirely.
 SIDEWAYS_NIFTY_THRESH        = 0.003   # 0.3% threshold
-SIDEWAYS_CONSECUTIVE_SCANS   = 3       # 3 consecutive NEUTRAL scans = sideways day
+SIDEWAYS_CONSECUTIVE_SCANS   = 2       # FIX-1: was 3, now 2
+
+
+# ── FIX-2: Per-stock per-day trade cap ───────────────────────────────
+# After this many CLOSED trades on a single symbol today, block further
+# entries for that symbol until next session reset.
+#
+# Motivation: BAJFINANCE (31% win-rate) and BEL (26% win-rate) kept
+# re-entering after losses, compounding drawdown. 3 trades = 2 normal
+# attempts + 1 recovery; if all 3 lose, that stock is done for the day.
+MAX_TRADES_PER_STOCK_PER_DAY = 3
+
+
+# ── FIX-3: Signal score floor on weak/neutral days ───────────────────
+# Signal score threshold when Nifty regime is NEUTRAL or WEAK.
+# Raised from 8 → 10 to cut noise trades on low-conviction days.
+# Expected win-rate improvement: 38% → 44%+.
+MIN_SIGNAL_SCORE_WEAK        = 10      # FIX-3: was 8
 
 
 # ── Trade mode ────────────────────────────────────────────────────────
@@ -178,9 +218,9 @@ VWAP_SOFT_PENALTY            = 0.03
 
 # ── Signal thresholds ─────────────────────────────────────────────────
 BUY_THRESHOLD_DEFAULT        = 0.55
-BUY_THRESHOLD_WEAK           = 0.58
+BUY_THRESHOLD_WEAK           = 0.60   # FIX-3: was 0.58 — tighter on weak days
 SELL_THRESHOLD_DEFAULT       = 0.60
-SELL_THRESHOLD_WEAK          = 0.58
+SELL_THRESHOLD_WEAK          = 0.60   # FIX-3: was 0.58 — aligned with buy
 MIN_RR_RATIO                 = 1.5
 
 

@@ -1,6 +1,23 @@
 """trade_manager.py — full execution layer for dhan_xgb_bot_v2/v3/v4
 
-v4.4 Changes 2026-07-18:
+v4.5 Changes 2026-07-18 (backtest fixes):
+
+FIX-1 [GAP-1]: SIDEWAYS_CONSECUTIVE_SCANS 3→2 (in config.py)
+  TradeManager itself is unchanged for this fix — the sideways-day
+  block lives in signal_engine / bot loop. Config change is enough.
+
+FIX-2: Per-stock per-day trade cap (MAX_TRADES_PER_STOCK_PER_DAY)
+  _stock_trade_count dict tracks closed trades per symbol per session.
+  enter_trade() checks count before entering.
+  reset_daily() clears the counter.
+  Prevents BAJFINANCE/BEL style over-trading (26-31% win-rate stocks
+  re-entering after losses and compounding drawdown).
+
+FIX-3: MIN_SIGNAL_SCORE_WEAK = 10 (in config.py)
+  TradeManager does not gate on signal score directly — that filter
+  lives in signal_engine. Config change + threshold change is enough.
+
+v4.4 Changes 2026-07-18 (retained):
 * SIZING REWORK — 'No cap, Rs1L per trade slot':
   compute_qty now uses SLOT BUDGET instead of a capital-percentage cap.
   slot_budget = CAPITAL / MAX_OPEN_POSITIONS
@@ -29,6 +46,7 @@ import logging
 import math
 import os
 import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, Optional
@@ -95,6 +113,11 @@ class TradeManager:
         self._realised_pnl: float = 0.0
         self._daily_cb_tripped    = False
 
+        # FIX-2: per-stock per-day closed-trade counter
+        # Keyed by symbol, value = number of closed trades today.
+        # Cleared by reset_daily().
+        self._stock_trade_count: Dict[str, int] = defaultdict(int)
+
         os.makedirs(os.path.dirname(cfg.TRADE_LOG_PATH), exist_ok=True)
         self._log_path = cfg.TRADE_LOG_PATH
         self._log_lock = threading.Lock()
@@ -112,6 +135,20 @@ class TradeManager:
         with self._lock:
             if len(self.positions) >= cfg.MAX_OPEN_POSITIONS:
                 return False
+        return True
+
+    def can_trade_symbol(self, symbol: str) -> bool:
+        """FIX-2: Return False once a symbol has hit MAX_TRADES_PER_STOCK_PER_DAY
+        closed trades in the current session.
+        """
+        limit = getattr(cfg, "MAX_TRADES_PER_STOCK_PER_DAY", 3)
+        count = self._stock_trade_count.get(symbol, 0)
+        if count >= limit:
+            log.info(
+                "[TradeManager] FIX-2: %s reached %d/%d trades today — blocked.",
+                symbol, count, limit,
+            )
+            return False
         return True
 
     def can_enter_sector(self, sector: str) -> bool:
@@ -215,6 +252,10 @@ class TradeManager:
         if not self.can_trade():
             return False
 
+        # FIX-2: block symbol if daily trade cap reached
+        if not self.can_trade_symbol(symbol):
+            return False
+
         sector = self._get_sector(symbol)
         if not self.can_enter_sector(sector):
             return False
@@ -290,6 +331,16 @@ class TradeManager:
             self._place_order(symbol, pos.qty, price, side=exit_side)
 
         self._realised_pnl += pnl
+
+        # FIX-2: increment per-stock closed-trade counter on every exit
+        self._stock_trade_count[symbol] += 1
+        log.debug(
+            "[TradeManager] FIX-2: %s trade_count today = %d/%d",
+            symbol,
+            self._stock_trade_count[symbol],
+            getattr(cfg, "MAX_TRADES_PER_STOCK_PER_DAY", 3),
+        )
+
         self._check_daily_cb()
 
         try:
@@ -407,6 +458,8 @@ class TradeManager:
         self._today            = date.today()
         self._realised_pnl     = 0.0
         self._daily_cb_tripped = False
+        # FIX-2: clear per-stock trade counts for the new session
+        self._stock_trade_count.clear()
         log.info("[TradeManager] Daily state reset for %s.", self._today)
 
     def _get_sector(self, symbol: str) -> str:
