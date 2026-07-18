@@ -15,6 +15,9 @@ Usage
     python backtest.py --source dhan    --start 2026-05-01 --end 2026-07-17
     python backtest.py --source yfinance --days 30
 
+# Debug mode -- prints per-bar skip reasons (use with --days 3 to keep output manageable)
+    python backtest.py --source yfinance --days 3 --debug
+
 Output files (written to repo root)
 ------------------------------------
   backtest_trades.csv   -- every trade: symbol, entry/exit time & px,
@@ -185,8 +188,8 @@ _DHAN_INTERVAL_MAP = {
 def _get_dhan_historical_method(dhan):
     """
     Dhan SDK has renamed the historical candle method across versions.
-    Probe the actual installed object and return a callable wrapper
-    so the rest of the code never has to worry about SDK version.
+    Probe the actual installed object and return the method name so
+    the rest of the code never has to worry about SDK version.
 
     Known names across SDK versions (checked in order of preference):
       v2.x  get_intraday_candle_data(security_id, exchange_segment,
@@ -201,7 +204,7 @@ def _get_dhan_historical_method(dhan):
         "get_intraday_candle_data",
         "historical_minute_charts",
         "intraday_minute_data",
-        "get_historical_data",          # possible future rename
+        "get_historical_data",
         "historical_data",
     ]
     found = None
@@ -249,7 +252,6 @@ def _dhan_call(dhan, method_name: str, sym: str, sec_id: int,
             to_date          = str(chunk_end),
         )
     elif method_name in ("historical_minute_charts", "intraday_minute_data"):
-        # v1 uses symbol string, not security_id
         return fn(
             symbol           = sym if not is_index else "NIFTY",
             exchange_segment = exch,
@@ -259,7 +261,6 @@ def _dhan_call(dhan, method_name: str, sym: str, sec_id: int,
             to_date          = str(chunk_end),
         )
     else:
-        # generic attempt with v2 signature
         return fn(
             security_id      = str(sec_id),
             exchange_segment = exch,
@@ -343,7 +344,7 @@ def fetch_dhan(
         sys.exit(1)
 
     dhan        = dhanhq(client_id, access_token)
-    method_name = _get_dhan_historical_method(dhan)   # auto-discover SDK method
+    method_name = _get_dhan_historical_method(dhan)
 
     result: dict[str, pd.DataFrame] = {}
     all_syms = symbols + [NIFTY_DHAN]
@@ -447,17 +448,16 @@ def _day_slice(df: pd.DataFrame, d: date) -> pd.DataFrame:
 
 def _get_regime(nifty_day: pd.DataFrame) -> tuple[str, float]:
     """
-    Determine intraday regime from Nifty candles for the day.
-
-    FIX: SIDEWAYS_NIFTY_THRESH is typically 0.003 (0.3%) which is the
-    open-to-close threshold for the WHOLE day.  For a 5-min bar that
-    threshold is far too tight -- almost every bar qualifies as NEUTRAL
-    causing sideways_day to trigger immediately and blocking ALL trades.
-
-    We use the full-day open vs close to classify:
+    Classify the day-level regime from Nifty open-to-close return.
       ret > +0.15%  ->  BULL
       ret < -0.15%  ->  WEAK
-      else          ->  NEUTRAL (but sideways_day guard uses bar-level logic separately)
+      else          ->  NEUTRAL
+
+    NOTE: SIDEWAYS_NIFTY_THRESH (0.003 = 0.3%) is intentionally NOT
+    used here because it is a whole-day threshold.  Using it on 5-min
+    bars causes almost every bar to look "neutral" and fires the
+    sideways guard instantly.  The bar-level sideways check below uses
+    its own per-bar threshold (_BAR_SIDEWAYS_THRESH = 0.0005 = 0.05%).
     """
     if nifty_day.empty:
         return "NEUTRAL", 0.0
@@ -542,10 +542,20 @@ def _trade_rec(
 # CORE -- bar-by-bar replay for ONE trading day
 # -------------------------------------------------------------------
 
+# Per-5-min-bar sideways threshold.
+# SIDEWAYS_NIFTY_THRESH (0.003 = 0.3%) is a WHOLE-DAY open-to-close threshold.
+# On individual 5-min bars the typical Nifty move is 0.02-0.08%.
+# Using 0.3% per bar means almost every bar is "flat" => sideways fires in
+# the first 10 minutes of every day and blocks all entries.
+# This constant is the correct per-bar equivalent.
+_BAR_SIDEWAYS_THRESH = 0.0005   # 0.05% per 5-min bar
+
+
 def replay_day(
     trade_date: date,
     all_data: dict[str, pd.DataFrame],
     nifty_key: str,
+    debug: bool = False,
 ) -> tuple[list[dict], dict]:
     nifty_day = _day_slice(all_data.get(nifty_key, pd.DataFrame()), trade_date)
     regime, _ = _get_regime(nifty_day)
@@ -558,17 +568,22 @@ def replay_day(
     open_pos: dict = {}
     stock_trades   = defaultdict(int)
 
-    # Sideways detection uses a rolling window of NIFTY BAR returns.
-    # FIX: compare bar return against a per-bar threshold (0.05% per 5-min bar)
-    # NOT against SIDEWAYS_NIFTY_THRESH which is a full-day 0.3% threshold.
-    _BAR_SIDEWAYS_THRESH = 0.0005   # 0.05% per 5-min bar -- realistic
+    # Sideways detection:
+    # KEY FIX -- sideways_day is NO LONGER a permanent latch.
+    # We track a rolling neutral_streak counter.  On each bar we check if
+    # the LAST N bars were all flat.  If yes, skip entry on THIS bar only.
+    # The moment the market makes a meaningful move, neutral_streak resets
+    # to 0 and trading resumes.  This matches live-bot behaviour where a
+    # sideways morning can give way to a directional afternoon session.
     neutral_streak = 0
-    sideways_day   = False
 
     post_target    = False
     profit_locked  = False
     cb_triggered   = False
     day_trades: list[dict] = []
+
+    # Count per-bar skip reasons for debug summary
+    skip_counts: dict[str, int] = defaultdict(int)
 
     all_ts: set = set()
     for sym in SYMBOLS:
@@ -645,29 +660,59 @@ def replay_day(
             open_pos.clear()
             break
 
-        # Sideways detection -- use per-bar threshold, NOT full-day SIDEWAYS_NIFTY_THRESH
+        # ----------------------------------------------------------------
+        # Sideways detection -- ROLLING WINDOW, NOT a permanent latch
+        #
+        # OLD (broken): once sideways_day=True it never reset, blocking
+        #               all entries for the rest of the day.
+        #
+        # NEW (correct): neutral_streak counts consecutive flat Nifty bars.
+        #   - If the last SIDEWAYS_CONSECUTIVE_SCANS bars were all flat
+        #     (<0.05% move each), skip entry on THIS bar only.
+        #   - As soon as one bar moves >= 0.05%, streak resets to 0 and
+        #     entries are allowed again on the next bar.
+        # ----------------------------------------------------------------
         nr = nifty_day[nifty_day.index == ts]
         if not nr.empty:
-            bar_ret = abs((nr.iloc[0]["close"] - nr.iloc[0]["open"]) / max(nr.iloc[0]["open"], 1))
-            neutral_streak = (neutral_streak + 1) if bar_ret < _BAR_SIDEWAYS_THRESH else 0
-            if neutral_streak >= SIDEWAYS_CONSECUTIVE_SCANS:
-                sideways_day = True
+            bar_open  = nr.iloc[0]["open"]
+            bar_close = nr.iloc[0]["close"]
+            bar_ret   = abs((bar_close - bar_open) / max(bar_open, 1))
+            if bar_ret < _BAR_SIDEWAYS_THRESH:
+                neutral_streak += 1
+            else:
+                neutral_streak = 0   # market moved -- reset streak
 
-        # Entry guards
-        if sideways_day:                                            continue
-        if NIFTY_WEAK_HARD_STOP and regime == "WEAK":              continue
-        if post_target and POST_TARGET_BULL_ONLY and not is_bull:   continue
-        if len(open_pos) >= MAX_OPEN_POSITIONS:                     continue
+        is_sideways_now = (neutral_streak >= SIDEWAYS_CONSECUTIVE_SCANS)
 
-        # Need at least 30 min of trading before entering (warm-up)
+        # Entry guards (evaluate in order; first failing guard logs reason)
+        if is_sideways_now:
+            skip_counts["sideways"] += 1
+            if debug:
+                print(f"  {ts}  SKIP sideways (streak={neutral_streak})")
+            continue
+        if NIFTY_WEAK_HARD_STOP and regime == "WEAK":
+            skip_counts["weak_regime"] += 1
+            continue
+        if post_target and POST_TARGET_BULL_ONLY and not is_bull:
+            skip_counts["post_target_non_bull"] += 1
+            continue
+        if len(open_pos) >= MAX_OPEN_POSITIONS:
+            skip_counts["max_positions"] += 1
+            continue
+
+        # Warm-up: need at least 30 min of data before entering
         if t < dtime(9, 45):
+            skip_counts["warmup"] += 1
             continue
 
         # Entry scan
         for sym in SYMBOLS:
-            if sym in open_pos:                                         continue
-            if stock_trades[sym] >= MAX_TRADES_PER_STOCK_PER_DAY:      continue
-            if len(open_pos) >= MAX_OPEN_POSITIONS:                     break
+            if sym in open_pos:
+                continue
+            if stock_trades[sym] >= MAX_TRADES_PER_STOCK_PER_DAY:
+                continue
+            if len(open_pos) >= MAX_OPEN_POSITIONS:
+                break
 
             df  = _day_slice(all_data.get(sym, pd.DataFrame()), trade_date)
             row = df[df.index == ts]
@@ -677,9 +722,13 @@ def replay_day(
 
             hist = df[df.index <= ts].tail(20)
             if len(hist) < 5:
+                if debug:
+                    print(f"  {ts}  {sym}  SKIP insufficient history ({len(hist)} bars)")
                 continue
             atr = _atr(hist)
             if np.isnan(atr) or atr <= 0:
+                if debug:
+                    print(f"  {ts}  {sym}  SKIP bad ATR ({atr})")
                 continue
 
             closes   = hist["close"].values
@@ -687,18 +736,24 @@ def replay_day(
             long_ma  = closes[-10:].mean() if len(closes) >= 10 else closes.mean()
             rsi      = _simple_rsi(closes, 14)
 
-            # FIX: relaxed signal conditions -- the original were too tight for 5-min bars.
-            # BULL: any bullish bar with short_ma trend alignment
-            # NEUTRAL: trend + moderate RSI
-            # WEAK: allow SHORT on bearish bars (bot currently only does LONG, so skip WEAK)
+            # Signal conditions (relaxed for 5-min bar reality):
+            #   BULL:    short_ma within 0.1% of long_ma (trend aligned),
+            #            RSI >= 40, bar is not strongly bearish
+            #   NEUTRAL: strict MA crossover + RSI in mid-zone
+            #   WEAK:    no LONG entries (SHORT side not yet implemented)
             if regime == "BULL":
                 ok = (short_ma >= long_ma * 0.999) and (rsi >= 40) and (c["close"] >= c["open"] * 0.9995)
             elif regime == "NEUTRAL":
                 ok = (short_ma >= long_ma) and (38 < rsi < 70) and (c["close"] >= c["open"] * 0.9995)
             else:
-                ok = False   # WEAK: skip until SHORT side is implemented
+                ok = False
 
             if not ok:
+                if debug:
+                    print(f"  {ts}  {sym}  SKIP signal "
+                          f"short_ma={short_ma:.2f} long_ma={long_ma:.2f} "
+                          f"rsi={rsi:.1f} close={c['close']:.2f} open={c['open']:.2f}")
+                skip_counts["signal"] += 1
                 continue
 
             entry = float(c["close"])
@@ -707,10 +762,20 @@ def replay_day(
             side  = "LONG"
             sl, tp, rr = _compute_sl_tp(entry, atr, side, tp_mult)
             if rr < MIN_RR_RATIO:
+                if debug:
+                    print(f"  {ts}  {sym}  SKIP RR={rr:.2f} < MIN_RR={MIN_RR_RATIO}")
+                skip_counts["rr_filter"] += 1
                 continue
             qty = _compute_qty(entry, sl)
             if qty <= 0:
+                if debug:
+                    print(f"  {ts}  {sym}  SKIP qty=0 (entry={entry:.2f} sl={sl:.2f})")
+                skip_counts["qty_zero"] += 1
                 continue
+
+            if debug:
+                print(f"  {ts}  {sym}  ENTRY {side} @ {entry:.2f}  sl={sl:.2f}  tp={tp:.2f}  "
+                      f"qty={qty}  rr={rr:.2f}  rsi={rsi:.1f}")
 
             open_pos[sym] = {
                 "entry":    entry,
@@ -720,6 +785,10 @@ def replay_day(
                 "tp":       tp,
                 "qty":      qty,
             }
+
+    if debug and skip_counts:
+        print(f"\n  [{trade_date}] Skip breakdown: "
+              + "  ".join(f"{k}={v}" for k, v in sorted(skip_counts.items())))
 
     wins   = [t for t in day_trades if t["pnl"] > 0]
     losses = [t for t in day_trades if t["pnl"] <= 0]
@@ -749,6 +818,7 @@ def run_backtest(
     start:    date | None = None,
     end:      date | None = None,
     interval: str        = "5",
+    debug:    bool       = False,
 ) -> None:
     if end is None:
         end = date.today() - timedelta(days=1)
@@ -760,6 +830,8 @@ def run_backtest(
     print(f"  Symbols   : {len(SYMBOLS)}  |  Capital: Rs.{CAPITAL:,.0f}")
     print(f"  Target/day: Rs.{DAILY_TARGET:,.0f}  |  Max daily loss: {MAX_DAILY_LOSS*100:.1f}%")
     print(f"  Profit-lock pullback: Rs.{PROFIT_PULLBACK_RS}  |  Interval: {interval}m")
+    if debug:
+        print(f"  DEBUG MODE: per-bar skip reasons will be printed")
     print(f"{'='*64}\n")
 
     if source == "dhan":
@@ -773,10 +845,9 @@ def run_backtest(
         print("\n[ERROR] No data returned. Check credentials and network.")
         sys.exit(1)
 
-    # Verify Nifty data arrived -- without it regime = NEUTRAL every day -> no BULL entries
     if nifty_key not in all_data:
         print(f"\n[WARN] Nifty data missing (key={nifty_key}). "
-              f"Regime will be NEUTRAL for all days -- entries will still fire on NEUTRAL logic.")
+              f"Regime will be NEUTRAL for all days -- entries will fire on NEUTRAL logic.")
 
     all_dates: set[date] = set()
     for df in all_data.values():
@@ -792,7 +863,7 @@ def run_backtest(
     cum_pnl = 0.0
 
     for d in trading_dates:
-        trades, summary = replay_day(d, all_data, nifty_key)
+        trades, summary = replay_day(d, all_data, nifty_key, debug=debug)
         cum_pnl              += summary["day_pnl"]
         summary["cum_pnl"]    = round(cum_pnl, 2)
         all_trades.extend(trades)
@@ -883,7 +954,6 @@ def run_backtest(
     summary_df.to_csv(p, index=False)
     print(f"  OK {p}")
 
-    # Write as UTF-8 to avoid cp1252 crash on Windows
     p = out / "backtest_report.txt"
     p.write_text(report, encoding="utf-8")
     print(f"  OK {p}\n")
@@ -905,6 +975,8 @@ if __name__ == "__main__":
                     help="End date YYYY-MM-DD  (default: yesterday)")
     ap.add_argument("--interval", type=str, default="5",
                     help="Candle interval in minutes: 1 5 15 25 60  (default: 5)")
+    ap.add_argument("--debug",    action="store_true",
+                    help="Print per-bar skip reasons (use with --days 3)")
     args = ap.parse_args()
 
     run_backtest(
@@ -913,4 +985,5 @@ if __name__ == "__main__":
         start    = date.fromisoformat(args.start) if args.start else None,
         end      = date.fromisoformat(args.end)   if args.end   else None,
         interval = args.interval,
+        debug    = args.debug,
     )
