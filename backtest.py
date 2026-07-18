@@ -50,6 +50,35 @@ Fix 3 -- NEUTRAL signal filter
        strict equality check caused near-zero entries on NEUTRAL days.
        0.2% tolerance lets valid setups through while still filtering
        clear downtrends.
+
+Fix 4 (2026-07-19) -- Consecutive-SL circuit breaker  [ROOT CAUSE #1]
+  NEW: MAX_CONSECUTIVE_SL = 3
+       If 3 SLs fire back-to-back within a single day, all new entries
+       are paused for PAUSE_AFTER_SL_STREAK bars (default 6 = 30 min).
+       After the cool-down, the streak counter resets.
+  WHY: Real backtest showed SL streaks of 6-7 on the worst days
+       (Jul 9: 7 SLs in a row → -₹4,461; Jul 2: 6 SLs → -₹3,283;
+       Jul 6: 7 SLs → -₹3,081; Jul 15: 6 SLs → -₹3,177).
+       The market was trending against entries but the bot kept
+       re-entering after each SL with no cooldown.
+
+Fix 5 (2026-07-19) -- Per-day per-stock loss cap  [ROOT CAUSE #2]
+  NEW: MAX_STOCK_LOSS_PER_DAY = -800  (Rs.)
+       Once a symbol accumulates >= Rs.800 loss in a single day,
+       no new entries are allowed for that symbol for the rest of day.
+  WHY: Real backtest: SBIN -₹3,574 (33 trades), LT -₹3,410 (10 trades),
+       RELIANCE -₹2,859 (15 trades), AXISBANK -₹2,600 (24 trades).
+       These 4 stocks alone caused ₹12,443 of the total ₹10,362 loss.
+       A single stock should not bleed more than Rs.800/day.
+
+Fix 6 (2026-07-19) -- NEUTRAL day max-trades cap  [ROOT CAUSE #3]
+  NEW: MAX_TRADES_NEUTRAL_DAY = 8
+       On NEUTRAL days (regime), total new entries are capped at 8.
+       BULL days retain the config MAX_OPEN_POSITIONS limit.
+  WHY: Real backtest: high-trade NEUTRAL days (>10 trades) had avg win
+       rate of only 32%; low-trade NEUTRAL days (<=6) had 47%.
+       The bot was over-trading on flat days, churning through capital
+       with poor signal quality.
 ================================================================
 """
 
@@ -68,6 +97,14 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
+
+# -------------------------------------------------------------------
+# NEW GUARD CONSTANTS (Fixes 4, 5, 6)
+# -------------------------------------------------------------------
+MAX_CONSECUTIVE_SL      = 3      # Fix 4: pause entries after N back-to-back SLs
+PAUSE_AFTER_SL_STREAK   = 6      # Fix 4: number of bars to pause (6 × 5min = 30 min)
+MAX_STOCK_LOSS_PER_DAY  = -800.0 # Fix 5: max Rs. loss per stock per day before blocking re-entry
+MAX_TRADES_NEUTRAL_DAY  = 8      # Fix 6: max total trades on a NEUTRAL day
 
 # -------------------------------------------------------------------
 # Load credentials from config/.env
@@ -212,20 +249,6 @@ _DHAN_INTERVAL_MAP = {
 # -------------------------------------------------------------------
 
 def _get_dhan_historical_method(dhan):
-    """
-    Dhan SDK has renamed the historical candle method across versions.
-    Probe the actual installed object and return the method name so
-    the rest of the code never has to worry about SDK version.
-
-    Known names across SDK versions (checked in order of preference):
-      v2.x  get_intraday_candle_data(security_id, exchange_segment,
-                                      instrument_type, interval,
-                                      from_date, to_date)
-      v1.x  historical_minute_charts(symbol, exchange_segment,
-                                      instrument_type, interval,
-                                      from_date, to_date)
-      v1.x  intraday_minute_data(...)  (some sub-versions)
-    """
     candidates = [
         "get_intraday_candle_data",
         "historical_minute_charts",
@@ -259,10 +282,6 @@ def _get_dhan_historical_method(dhan):
 def _dhan_call(dhan, method_name: str, sym: str, sec_id: int,
                is_index: bool, interval: str,
                chunk_start: date, chunk_end: date):
-    """
-    Unified caller that handles both v1 and v2 SDK signatures.
-    Returns the raw response dict/list (or raises).
-    """
     exch = "IDX_I"  if is_index else "NSE_EQ"
     inst = "INDEX"  if is_index else "EQUITY"
     ivl  = _DHAN_INTERVAL_MAP.get(interval, "5")
@@ -477,27 +496,9 @@ def _get_regime(nifty_day: pd.DataFrame) -> tuple[str, float]:
     Classify the day-level regime from Nifty open-to-close return.
 
     FIX (v2): Thresholds raised from ±0.15% to ±0.50%.
-    -------------------------------------------------------
-    The original ±0.15% band was far too tight for NSE.  A typical
-    Nifty session moves 0.3-1.5% open-to-close.  With the old band:
-      - A day that closes +0.20% from open → BULL  (fine)
-      - A day that closes -0.20% from open → WEAK  (then NIFTY_WEAK_HARD_STOP
-        blocks ALL new entries for the entire day → 0 trades)
-      - Most sessions fell into WEAK or NEUTRAL, producing 0 trades.
-
-    With ±0.50%:
       ret > +0.50%  ->  BULL    (strong up day)
       ret < -0.50%  ->  WEAK    (strong down day -- hard-stop applies)
       else          ->  NEUTRAL (range-bound / mild drift -- normal trading)
-
-    This matches real NSE session behaviour and allows entries on the
-    majority of days that are mildly up or mildly down.
-
-    NOTE: SIDEWAYS_NIFTY_THRESH (0.003 = 0.3%) is intentionally NOT
-    used here because it is a whole-day threshold.  Using it on 5-min
-    bars causes almost every bar to look "neutral" and fires the
-    sideways guard instantly.  The bar-level sideways check uses its
-    own per-bar threshold (_BAR_SIDEWAYS_THRESH = 0.0005 = 0.05%).
     """
     if nifty_day.empty:
         return "NEUTRAL", 0.0
@@ -506,7 +507,6 @@ def _get_regime(nifty_day: pd.DataFrame) -> tuple[str, float]:
     if first_open == 0:
         return "NEUTRAL", 0.0
     ret = (last_close - first_open) / first_open
-    # FIX: raised from ±0.0015 (±0.15%) to ±0.005 (±0.50%)
     if   ret >  0.005: return "BULL",    round(float(ret), 5)
     elif ret < -0.005: return "WEAK",    round(float(ret), 5)
     else:              return "NEUTRAL", round(float(ret), 5)
@@ -583,12 +583,6 @@ def _trade_rec(
 # CORE -- bar-by-bar replay for ONE trading day
 # -------------------------------------------------------------------
 
-# Per-5-min-bar sideways threshold.
-# SIDEWAYS_NIFTY_THRESH (0.003 = 0.3%) is a WHOLE-DAY open-to-close threshold.
-# On individual 5-min bars the typical Nifty move is 0.02-0.08%.
-# Using 0.3% per bar means almost every bar is "flat" => sideways fires in
-# the first 10 minutes of every day and blocks all entries.
-# This constant is the correct per-bar equivalent.
 _BAR_SIDEWAYS_THRESH = 0.0005   # 0.05% per 5-min bar
 
 
@@ -607,23 +601,22 @@ def replay_day(
     daily_pnl      = 0.0
     peak_pnl       = 0.0
     open_pos: dict = {}
-    stock_trades   = defaultdict(int)
+    stock_trades   = defaultdict(int)         # total entries per symbol per day
+    stock_day_pnl  = defaultdict(float)       # Fix 5: cumulative pnl per symbol per day
 
-    # Sideways detection:
-    # sideways_day is NO LONGER a permanent latch.
-    # We track a rolling neutral_streak counter.  On each bar we check if
-    # the LAST N bars were all flat.  If yes, skip entry on THIS bar only.
-    # The moment the market makes a meaningful move, neutral_streak resets
-    # to 0 and trading resumes.  This matches live-bot behaviour where a
-    # sideways morning can give way to a directional afternoon session.
+    # Fix 4: Consecutive-SL circuit breaker state
+    consecutive_sl  = 0                       # running count of back-to-back SLs
+    sl_pause_bars   = 0                       # bars remaining in cool-down
+
+    # Fix 6: NEUTRAL day total trade counter
+    neutral_trade_count = 0
+
     neutral_streak = 0
-
     post_target    = False
     profit_locked  = False
     cb_triggered   = False
     day_trades: list[dict] = []
 
-    # Count per-bar skip reasons for debug summary
     skip_counts: dict[str, int] = defaultdict(int)
 
     all_ts: set = set()
@@ -642,9 +635,6 @@ def replay_day(
 
         # ----------------------------------------------------------------
         # EOD force-close at 15:14
-        # NOTE: SL/TP management runs BEFORE all entry guards (including
-        # the WEAK hard-stop) so open positions are always managed even
-        # on WEAK days.  Only NEW entries are gated by regime.
         # ----------------------------------------------------------------
         if t >= dtime(15, 14):
             for sym, pos in list(open_pos.items()):
@@ -655,6 +645,7 @@ def replay_day(
                       else (pos["entry"] - ep) * pos["qty"]
                 daily_pnl += pnl
                 peak_pnl   = max(peak_pnl, daily_pnl)
+                stock_day_pnl[sym] += pnl
                 day_trades.append(_trade_rec(trade_date, sym, pos, ep, ts, pnl, "EOD", regime))
             open_pos.clear()
             break
@@ -665,9 +656,7 @@ def replay_day(
             continue
 
         # ----------------------------------------------------------------
-        # SL / TP check on open positions
-        # FIX: This block runs unconditionally -- BEFORE the WEAK regime
-        # guard below.  Open positions must be managed even on WEAK days.
+        # SL / TP check on open positions (runs BEFORE all entry guards)
         # ----------------------------------------------------------------
         for sym in list(open_pos.keys()):
             pos = open_pos[sym]
@@ -686,9 +675,25 @@ def replay_day(
                          else (pos["entry"] - ep) * pos["qty"]
                 daily_pnl += pnl
                 peak_pnl   = max(peak_pnl, daily_pnl)
-                stock_trades[sym] += 1
+                stock_day_pnl[sym] += pnl
+                stock_trades[sym]  += 1
+
+                # Fix 4: track consecutive SL streak
+                if reason == "SL":
+                    consecutive_sl += 1
+                    if consecutive_sl >= MAX_CONSECUTIVE_SL:
+                        sl_pause_bars = PAUSE_AFTER_SL_STREAK
+                        if debug:
+                            print(f"  {ts}  CONSECUTIVE_SL={consecutive_sl} → pausing {sl_pause_bars} bars")
+                else:
+                    consecutive_sl = 0   # any win/TP resets the streak
+
                 day_trades.append(_trade_rec(trade_date, sym, pos, ep, ts, pnl, reason, regime))
                 del open_pos[sym]
+
+        # Fix 4: decrement SL-streak pause counter each bar
+        if sl_pause_bars > 0:
+            sl_pause_bars -= 1
 
         # Profit-lock check
         if daily_pnl >= DAILY_TARGET:
@@ -724,23 +729,27 @@ def replay_day(
             if bar_ret < _BAR_SIDEWAYS_THRESH:
                 neutral_streak += 1
             else:
-                neutral_streak = 0   # market moved -- reset streak
+                neutral_streak = 0
 
         is_sideways_now = (neutral_streak >= SIDEWAYS_CONSECUTIVE_SCANS)
 
         # ----------------------------------------------------------------
-        # Entry guards -- evaluated in order; first failing guard skips
-        # new entry scan for this bar.
-        # FIX: WEAK guard only prevents NEW entries.  SL/TP management
-        # (above) already ran unconditionally before reaching this point.
+        # Entry guards
         # ----------------------------------------------------------------
         if is_sideways_now:
             skip_counts["sideways"] += 1
             if debug:
                 print(f"  {ts}  SKIP sideways (streak={neutral_streak})")
             continue
+
+        # Fix 4: SL-streak cooldown -- skip new entries during pause window
+        if sl_pause_bars > 0:
+            skip_counts["sl_streak_pause"] += 1
+            if debug:
+                print(f"  {ts}  SKIP sl_streak_pause (bars_left={sl_pause_bars})")
+            continue
+
         if NIFTY_WEAK_HARD_STOP and regime == "WEAK":
-            # Only block new entries; existing positions were handled above
             skip_counts["weak_regime"] += 1
             continue
         if post_target and POST_TARGET_BULL_ONLY and not is_bull:
@@ -748,6 +757,13 @@ def replay_day(
             continue
         if len(open_pos) >= MAX_OPEN_POSITIONS:
             skip_counts["max_positions"] += 1
+            continue
+
+        # Fix 6: NEUTRAL day trade cap
+        if regime == "NEUTRAL" and neutral_trade_count >= MAX_TRADES_NEUTRAL_DAY:
+            skip_counts["neutral_day_cap"] += 1
+            if debug:
+                print(f"  {ts}  SKIP neutral_day_cap ({neutral_trade_count}/{MAX_TRADES_NEUTRAL_DAY})")
             continue
 
         # Warm-up: need at least 30 min of data before entering
@@ -761,6 +777,14 @@ def replay_day(
                 continue
             if stock_trades[sym] >= MAX_TRADES_PER_STOCK_PER_DAY:
                 continue
+
+            # Fix 5: per-stock daily loss cap
+            if stock_day_pnl[sym] <= MAX_STOCK_LOSS_PER_DAY:
+                skip_counts["stock_loss_cap"] += 1
+                if debug:
+                    print(f"  {ts}  {sym}  SKIP stock_loss_cap (day_pnl={stock_day_pnl[sym]:.0f})")
+                continue
+
             if len(open_pos) >= MAX_OPEN_POSITIONS:
                 break
 
@@ -786,28 +810,19 @@ def replay_day(
             long_ma  = closes[-10:].mean() if len(closes) >= 10 else closes.mean()
             rsi      = _simple_rsi(closes, 14)
 
-            # Signal conditions:
-            #   BULL:    short_ma within 0.1% of long_ma (trend aligned),
-            #            RSI >= 40, bar is not strongly bearish
-            #   NEUTRAL: short_ma >= long_ma with 0.2% tolerance (FIX: was strict equality),
-            #            RSI in 35-75 (FIX: was 38-70), bar not strongly bearish
-            #   WEAK:    no LONG entries (SHORT side not yet implemented)
             if regime == "BULL":
                 ok = (short_ma >= long_ma * 0.999) and (rsi >= 40) and (c["close"] >= c["open"] * 0.9995)
             elif regime == "NEUTRAL":
-                # FIX: loosened short_ma tolerance 0.999 -> 0.998 and RSI 38-70 -> 35-75
-                # On flat days short_ma and long_ma are nearly identical; strict equality
-                # filtered out nearly all valid setups on NEUTRAL days.
                 ok = (short_ma >= long_ma * 0.998) and (35 < rsi < 75) and (c["close"] >= c["open"] * 0.9995)
             else:
                 ok = False
 
             if not ok:
+                skip_counts["signal"] += 1
                 if debug:
                     print(f"  {ts}  {sym}  SKIP signal "
                           f"short_ma={short_ma:.2f} long_ma={long_ma:.2f} "
                           f"rsi={rsi:.1f} close={c['close']:.2f} open={c['open']:.2f}")
-                skip_counts["signal"] += 1
                 continue
 
             entry = float(c["close"])
@@ -816,15 +831,15 @@ def replay_day(
             side  = "LONG"
             sl, tp, rr = _compute_sl_tp(entry, atr, side, tp_mult)
             if rr < MIN_RR_RATIO:
+                skip_counts["rr_filter"] += 1
                 if debug:
                     print(f"  {ts}  {sym}  SKIP RR={rr:.2f} < MIN_RR={MIN_RR_RATIO}")
-                skip_counts["rr_filter"] += 1
                 continue
             qty = _compute_qty(entry, sl)
             if qty <= 0:
+                skip_counts["qty_zero"] += 1
                 if debug:
                     print(f"  {ts}  {sym}  SKIP qty=0 (entry={entry:.2f} sl={sl:.2f})")
-                skip_counts["qty_zero"] += 1
                 continue
 
             if debug:
@@ -839,6 +854,10 @@ def replay_day(
                 "tp":       tp,
                 "qty":      qty,
             }
+
+            # Fix 6: count new entries on NEUTRAL days
+            if regime == "NEUTRAL":
+                neutral_trade_count += 1
 
     if debug and skip_counts:
         print(f"\n  [{trade_date}] Skip breakdown: "
@@ -885,6 +904,9 @@ def run_backtest(
     print(f"  Symbols   : {len(SYMBOLS)}  |  Capital: Rs.{CAPITAL:,.0f}")
     print(f"  Target/day: Rs.{DAILY_TARGET:,.0f}  |  Max daily loss: {MAX_DAILY_LOSS*100:.1f}%")
     print(f"  Profit-lock pullback: Rs.{PROFIT_PULLBACK_RS}  |  Interval: {interval}m")
+    print(f"  [Guards] consec-SL={MAX_CONSECUTIVE_SL} pause={PAUSE_AFTER_SL_STREAK}bars  "
+          f"stock-loss-cap=Rs.{abs(MAX_STOCK_LOSS_PER_DAY):.0f}  "
+          f"neutral-trade-cap={MAX_TRADES_NEUTRAL_DAY}")
     if debug:
         print(f"  DEBUG MODE: per-bar skip reasons will be printed")
     print(f"{'='*64}\n")
@@ -902,7 +924,7 @@ def run_backtest(
 
     if nifty_key not in all_data:
         print(f"\n[WARN] Nifty data missing (key={nifty_key}). "
-              f"Regime will be NEUTRAL for all days -- entries will fire on NEUTRAL logic.")
+              f"Regime will be NEUTRAL for all days.")
 
     all_dates: set[date] = set()
     for df in all_data.values():
@@ -972,6 +994,9 @@ def run_backtest(
         f"Capital            : Rs.{CAPITAL:>14,.0f}\n"
         f"Daily Target       : Rs.{DAILY_TARGET:>14,.0f}\n"
         f"Profit-lock        : Rs.{PROFIT_PULLBACK_RS} pullback after target\n"
+        f"Consec-SL guard    : pause after {MAX_CONSECUTIVE_SL} SLs for {PAUSE_AFTER_SL_STREAK} bars\n"
+        f"Stock loss cap/day : Rs.{abs(MAX_STOCK_LOSS_PER_DAY):.0f}\n"
+        f"Neutral trade cap  : {MAX_TRADES_NEUTRAL_DAY} entries/day\n"
         f"\n{sep}\nP & L SUMMARY\n{sep}\n"
         f"Total Net P&L      : Rs.{total_pnl:>+14,.2f}\n"
         f"Profitable Days    : {profit_days:>4} / {len(trading_dates)}\n"
