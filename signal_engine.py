@@ -1,17 +1,23 @@
 # ============================================================
 # signal_engine.py — dhan_xgb_bot_v2
-# v4.4 PATCH 2026-07-18:
-#   GAP-2/3: get_signal() now accepts tp_mult parameter.
-#     - tp_mult is computed by bot._get_tp_mult() before calling get_signal.
-#     - 1.8x on NEUTRAL/WEAK/SIDEWAYS days (choppy market — hit TP sooner)
-#     - 2.5x on BULL + above resistance days (ride the trend)
-#     - SL/TP in result dict computed with this tp_mult.
-#     - tp_mult stored in result dict so trade_manager can use same value.
+# v4.6 PATCH 2026-07-19 (4 real-data backtest bugs):
 #
+#   BUG-2 FIX: NEUTRAL regime consecutive SL block
+#     _neutral_sl_streak tracks consecutive SL exits on NEUTRAL days.
+#     get_signal() rejects new entries when streak >= NEUTRAL_CONSEC_SL_BLOCK (2).
+#     reset_neutral_sl_streak() called by bot on any winning exit.
+#     Also: BUY_THRESHOLD_NEUTRAL (0.62) applied when regime == NEUTRAL
+#     (stricter than default 0.55, slightly looser than WEAK 0.60).
+#
+#   BUG-4 FIX: Banking stocks min threshold on NEUTRAL days
+#     When regime == NEUTRAL and symbol in cfg.BANKING_STOCKS:
+#       buy_thr elevated to cfg.BUY_THRESHOLD_BANKING_NEUTRAL (0.64)
+#     Addresses SBIN+LT+RELIANCE+AXISBANK = -₹11,800 combined loss.
+#
+# v4.4 PATCH 2026-07-18 (retained):
+#   GAP-2/3: adaptive tp_mult (1.8x choppy / 2.5x BULL)
 # v4.3 PATCH 2026-07-18 (retained):
-#   FIX-1b: REMOVED daily_target gate (double-gate bug fixed)
-#   FIX-7b: Lunch hour gate added
-#
+#   Lunch hour gate, daily_target gate removal
 # v4.0 Changes 2026-07-17 (retained):
 #   SELL (SHORT) signal, per-stock sideways skip, opening momentum bonus
 # ============================================================
@@ -25,6 +31,30 @@ from features import build_features, FEATURE_COLS
 import config as cfg
 
 log = logging.getLogger("signal_engine")
+
+# ── BUG-2: Session-level NEUTRAL consecutive SL streak tracker ────────
+# Incremented by bot after each SL exit on a NEUTRAL day.
+# Reset to 0 by bot after any winning exit on a NEUTRAL day.
+# get_signal() reads this to gate NEUTRAL-day entries.
+_neutral_sl_streak: int = 0
+
+def increment_neutral_sl_streak() -> int:
+    """Call from bot after an SL exit on a NEUTRAL regime day."""
+    global _neutral_sl_streak
+    _neutral_sl_streak += 1
+    log.info(
+        "[BUG-2] NEUTRAL SL streak = %d/%d",
+        _neutral_sl_streak,
+        getattr(cfg, "NEUTRAL_CONSEC_SL_BLOCK", 2),
+    )
+    return _neutral_sl_streak
+
+def reset_neutral_sl_streak() -> None:
+    """Call from bot after a winning exit OR at session reset."""
+    global _neutral_sl_streak
+    _neutral_sl_streak = 0
+    log.debug("[BUG-2] NEUTRAL SL streak reset to 0.")
+
 
 # ── Lazy SymbolPenalty ────────────────────────────────────────────────
 _PENALTY = None
@@ -130,20 +160,18 @@ class SignalEngine:
 
     # ──────────────────────────────────────────────────────────────────
     # MAIN SIGNAL: returns BUY, SELL, or HOLD
-    # GAP-2/3: tp_mult parameter added — adaptive TP multiplier
     # ──────────────────────────────────────────────────────────────────
     def get_signal(self, symbol, df, current_positions,
                    nifty_regime="BULL", nifty_ret_5c=0.0,
                    daily_pnl=0.0, tp_mult: float = None):
 
-        # Default tp_mult from config if not provided
         if tp_mult is None:
             tp_mult = getattr(cfg, "ATR_TP_MULT", 1.8)
 
         result = {"action": "HOLD", "prob": 0.0, "entry": 0.0,
                   "sl": 0.0, "target": 0.0, "reject_reason": None,
                   "atr": 0.0, "qty_factor": 1.0, "side": "LONG",
-                  "tp_mult": tp_mult}   # pass through to trade_manager
+                  "tp_mult": tp_mult}
         now = datetime.now().time()
 
         def reject(reason):
@@ -155,7 +183,7 @@ class SignalEngine:
         if now < cfg.NO_NEW_TRADE_BEFORE or now >= cfg.NO_NEW_TRADE_AFTER:
             return reject("OUTSIDE_HOURS")
 
-        # ── Lunch hour gate (FIX-7b) ───────────────────────────────────
+        # ── Lunch hour gate ────────────────────────────────────────────
         if getattr(cfg, 'AVOID_LUNCH_HOURS', False):
             from datetime import time as _dtime
             try:
@@ -167,6 +195,16 @@ class SignalEngine:
                     return reject("LUNCH_HOURS")
             except Exception:
                 pass
+
+        # ── BUG-2: NEUTRAL consecutive SL block ────────────────────────
+        # After NEUTRAL_CONSEC_SL_BLOCK (2) consecutive SL hits on a
+        # NEUTRAL day, block all new entries for the rest of the session.
+        if nifty_regime == "NEUTRAL":
+            block_at = getattr(cfg, "NEUTRAL_CONSEC_SL_BLOCK", 2)
+            if _neutral_sl_streak >= block_at:
+                return reject(
+                    f"NEUTRAL_SL_STREAK({_neutral_sl_streak}>={block_at})"
+                )
 
         # ── Model gate ─────────────────────────────────────────────────
         if self.model is None:
@@ -295,10 +333,26 @@ class SignalEngine:
         is_opening  = session_min <= 15
 
         # ── Thresholds (adaptive per regime) ──────────────────────────
-        buy_thr  = cfg.BUY_THRESHOLD_WEAK  if nifty_regime == "WEAK" else cfg.BUY_THRESHOLD_DEFAULT
-        sell_thr = (getattr(cfg, "SELL_THRESHOLD_WEAK",    0.58)
-                    if nifty_regime == "WEAK"
-                    else getattr(cfg, "SELL_THRESHOLD_DEFAULT", 0.60))
+        # Priority: WEAK > NEUTRAL > BANKING_NEUTRAL > DEFAULT
+        if nifty_regime == "WEAK":
+            buy_thr  = cfg.BUY_THRESHOLD_WEAK
+            sell_thr = getattr(cfg, "SELL_THRESHOLD_WEAK", 0.60)
+        elif nifty_regime == "NEUTRAL":
+            # BUG-2: NEUTRAL gets its own (tighter) threshold
+            buy_thr  = getattr(cfg, "BUY_THRESHOLD_NEUTRAL", 0.62)
+            sell_thr = getattr(cfg, "SELL_THRESHOLD_DEFAULT", 0.60)
+            # BUG-4: Banking/high-beta names need even higher conviction on NEUTRAL
+            banking_stocks = getattr(cfg, "BANKING_STOCKS", [])
+            if symbol in banking_stocks:
+                banking_thr = getattr(cfg, "BUY_THRESHOLD_BANKING_NEUTRAL", 0.64)
+                buy_thr = max(buy_thr, banking_thr)
+                log.debug(
+                    "[BUG-4] %s is banking/high-beta — NEUTRAL buy_thr raised to %.2f",
+                    symbol, buy_thr,
+                )
+        else:  # BULL or unknown
+            buy_thr  = cfg.BUY_THRESHOLD_DEFAULT
+            sell_thr = getattr(cfg, "SELL_THRESHOLD_DEFAULT", 0.60)
 
         breakout_ok = int(feat.iloc[0].get("breakout_confirm", 1))
         above_vwap  = int(feat.iloc[0].get("above_vwap",  1))
@@ -357,18 +411,18 @@ class SignalEngine:
         if not action_buy and not action_sell:
             return reject(f"LOW_PROB(buy={prob_buy:.3f} sell={prob_sell:.3f})")
 
-        # ── SL / TP calculation using adaptive tp_mult ─────────────────
+        # ── SL / TP calculation ────────────────────────────────────────
         if action_buy:
             sl     = max(price - cfg.ATR_SL_MULT * atr, price * (1 - cfg.MAX_SL_PCT))
             sl     = min(sl, price * (1 - cfg.MIN_SL_PCT))
-            target = price + tp_mult * atr         # GAP-2/3: adaptive TP
+            target = price + tp_mult * atr
             rr     = ((target - price) / (price - sl)) if price > sl else 0
             side   = "LONG"
             prob   = prob_buy
         else:
             sl     = min(price + cfg.ATR_SL_MULT * atr, price * (1 + cfg.MAX_SL_PCT))
             sl     = max(sl, price * (1 + cfg.MIN_SL_PCT))
-            target = price - tp_mult * atr         # GAP-2/3: adaptive TP
+            target = price - tp_mult * atr
             rr     = ((price - target) / (sl - price)) if sl > price else 0
             side   = "SHORT"
             prob   = prob_sell
@@ -376,7 +430,7 @@ class SignalEngine:
         if rr < cfg.MIN_RR_RATIO:
             return reject(f"LOW_RR({rr:.2f})")
 
-        # ── qty_factor from symbol penalty ────────────────────────────
+        # ── qty_factor from symbol penalty ─────────────────────────────
         qty_factor = 1.0
         if penalty is not None:
             qty_factor = penalty.penalty_factor(symbol) if hasattr(penalty, "penalty_factor") else 1.0
@@ -394,7 +448,7 @@ class SignalEngine:
             "atr":           round(atr,    2),
             "rr_ratio":      round(rr,     2),
             "prob":          round(prob,   4),
-            "tp_mult":       round(tp_mult, 2),   # stored for trade_manager
+            "tp_mult":       round(tp_mult, 2),
             "reject_reason": None,
         })
         self._log(symbol, result)

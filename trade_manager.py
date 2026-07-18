@@ -1,39 +1,25 @@
 """trade_manager.py — full execution layer for dhan_xgb_bot_v2/v3/v4
 
-v4.5 Changes 2026-07-18 (backtest fixes):
+v4.6 Changes 2026-07-19 (4 real-data backtest bugs):
 
-FIX-1 [GAP-1]: SIDEWAYS_CONSECUTIVE_SCANS 3→2 (in config.py)
-  TradeManager itself is unchanged for this fix — the sideways-day
-  block lives in signal_engine / bot loop. Config change is enough.
-
-FIX-2: Per-stock per-day trade cap (MAX_TRADES_PER_STOCK_PER_DAY)
-  _stock_trade_count dict tracks closed trades per symbol per session.
-  enter_trade() checks count before entering.
+BUG-1 FIX — MAX_TRADES_PER_DAY session hard stop:
+  _session_trade_count tracks ALL closed trades this session (all symbols).
+  can_trade() blocks new entries once count >= cfg.MAX_TRADES_PER_DAY (8).
+  enter_trade() increments _session_trade_count on every successful entry.
   reset_daily() clears the counter.
-  Prevents BAJFINANCE/BEL style over-trading (26-31% win-rate stocks
-  re-entering after losses and compounding drawdown).
+  Prevents Jul-9 style 17-trade bleeding day (11.8% win rate, -₹4,462).
 
-FIX-3: MIN_SIGNAL_SCORE_WEAK = 10 (in config.py)
-  TradeManager does not gate on signal score directly — that filter
-  lives in signal_engine. Config change + threshold change is enough.
+BUG-3 FIX — MAX_DAILY_LOSS config tightened:
+  No code change in TradeManager — threshold comes from config.
+  Config changed: 0.02 → 0.00375 (Rs8000 → Rs1500).
+  _check_daily_cb() uses cfg.MAX_DAILY_LOSS as before.
+
+v4.5 Changes 2026-07-18 (retained):
+  FIX-2: MAX_TRADES_PER_STOCK_PER_DAY per-symbol cap
+  (BUG-1 is the SESSION-level cap — both coexist and complement)
 
 v4.4 Changes 2026-07-18 (retained):
-* SIZING REWORK — 'No cap, Rs1L per trade slot':
-  compute_qty now uses SLOT BUDGET instead of a capital-percentage cap.
-  slot_budget = CAPITAL / MAX_OPEN_POSITIONS
-             = Rs4,00,000 / 4 = Rs1,00,000 per slot
-  qty = floor(slot_budget / entry_price)
-  e.g. Rs1000 stock -> qty = floor(1,00,000 / 1000) = 100 shares
-  No arbitrary 20%/30% cap. Full slot budget deployed.
-  Risk is still controlled via SL (qty * sl_pts capped at RISK_PER_TRADE * capital).
-  We take the SMALLER of: risk-based qty OR slot-budget qty.
-  This ensures:
-    - Never exceed Rs1L per slot (capital protection)
-    - Never risk more than Rs6000 per trade (loss protection)
-    - On Rs1000 stock: qty=100, SL Rs6 away -> risk=Rs600 (well within)
-
-v4.3 Changes 2026-07-18 (retained):
-  FIX-3 explicit qty=0 guard, can_trade() DAILY_TARGET gate removed.
+  SIZING: slot_budget = CAPITAL/MAX_OPEN_POSITIONS = Rs1L per trade.
 
 v4.0 Changes 2026-07-17 (retained):
   SHORT position support, side=LONG/SHORT throughout.
@@ -113,10 +99,12 @@ class TradeManager:
         self._realised_pnl: float = 0.0
         self._daily_cb_tripped    = False
 
-        # FIX-2: per-stock per-day closed-trade counter
-        # Keyed by symbol, value = number of closed trades today.
-        # Cleared by reset_daily().
+        # FIX-2 (v4.5): per-stock per-day closed-trade counter
         self._stock_trade_count: Dict[str, int] = defaultdict(int)
+
+        # BUG-1 (v4.6): session-level total-trade counter (all symbols)
+        # Blocks new entries once >= MAX_TRADES_PER_DAY regardless of symbol.
+        self._session_trade_count: int = 0
 
         os.makedirs(os.path.dirname(cfg.TRADE_LOG_PATH), exist_ok=True)
         self._log_path = cfg.TRADE_LOG_PATH
@@ -128,19 +116,33 @@ class TradeManager:
         log.info("[TradeManager] WatchlistManager linked.")
 
     def can_trade(self) -> bool:
+        """Return True only when all session-level gates pass.
+
+        Gates (in order):
+          1. Daily date rollover check
+          2. Daily loss circuit breaker
+          3. Max open positions
+          4. BUG-1: Session trade cap (MAX_TRADES_PER_DAY)
+        """
         self._reset_daily_if_needed()
         if self._daily_cb_tripped:
-            log.warning("[TradeManager] Daily-loss CB ACTIVE.")
+            log.warning("[TradeManager] Daily-loss CB ACTIVE — no new trades.")
             return False
         with self._lock:
             if len(self.positions) >= cfg.MAX_OPEN_POSITIONS:
                 return False
+        # BUG-1: session-level hard cap
+        max_day = getattr(cfg, "MAX_TRADES_PER_DAY", 8)
+        if self._session_trade_count >= max_day:
+            log.warning(
+                "[TradeManager] BUG-1: Session trade cap hit (%d/%d) — no new trades today.",
+                self._session_trade_count, max_day,
+            )
+            return False
         return True
 
     def can_trade_symbol(self, symbol: str) -> bool:
-        """FIX-2: Return False once a symbol has hit MAX_TRADES_PER_STOCK_PER_DAY
-        closed trades in the current session.
-        """
+        """FIX-2 (v4.5): Return False once a symbol hits MAX_TRADES_PER_STOCK_PER_DAY."""
         limit = getattr(cfg, "MAX_TRADES_PER_STOCK_PER_DAY", 3)
         count = self._stock_trade_count.get(symbol, 0)
         if count >= limit:
@@ -158,10 +160,6 @@ class TradeManager:
 
     def compute_sl_tp(self, entry: float, atr: float, side: str = "LONG",
                       tp_mult: float = None) -> tuple:
-        """Compute SL and TP.
-        GAP-3: tp_mult can be passed dynamically (1.8 choppy, 2.5 bull).
-        Defaults to cfg.ATR_TP_MULT if not provided.
-        """
         if tp_mult is None:
             tp_mult = cfg.ATR_TP_MULT
 
@@ -182,36 +180,18 @@ class TradeManager:
         return round(sl, 2), round(tp, 2), round(rr, 4)
 
     def compute_qty(self, entry: float, sl: float) -> int:
-        """Compute share quantity — SLOT BUDGET approach.
-
-        v4.4: No percentage cap. Each trade slot gets:
-            slot_budget = CAPITAL / MAX_OPEN_POSITIONS
-
-        qty is the MINIMUM of:
-          (a) risk-based qty  = floor(risk_amount / sl_pts)
-              caps downside risk at RISK_PER_TRADE * CAPITAL
-          (b) slot-based qty  = floor(slot_budget / entry)
-              caps capital deployment to 1 slot (Rs1L on Rs4L / 4 trades)
-
-        Example — Rs1000 stock, ATR=Rs5, SL=Rs6:
-          risk_amount  = 0.015 * 4,00,000 = Rs6,000
-          risk_qty     = floor(6000 / 6)  = 1000  shares (risk-only)
-          slot_budget  = 4,00,000 / 4     = Rs1,00,000
-          slot_qty     = floor(1,00,000 / 1000) = 100  shares  <- BINDING
-          Final qty    = min(1000, 100)   = 100 shares
-          Capital used = 100 * 1000       = Rs1,00,000 ✅
-          Actual risk  = 100 * 6          = Rs600 (well within Rs6000 limit)
+        """Slot-budget qty sizing (v4.4).
+        qty = min(risk_qty, slot_qty)
+        slot_budget = CAPITAL / MAX_OPEN_POSITIONS = Rs1L on Rs4L / 4 trades.
         """
         sl_pts = abs(entry - sl)
         if sl_pts <= 0:
             log.warning("[compute_qty] sl_pts=0 for entry=%.2f — skipping.", entry)
             return 0
 
-        # (a) Risk-based qty
         risk_amount = cfg.RISK_PER_TRADE * self.capital
         risk_qty    = math.floor(risk_amount / sl_pts)
 
-        # (b) Slot-based qty — slot_budget = CAPITAL / MAX_OPEN_POSITIONS
         slot_budget = self.capital / max(cfg.MAX_OPEN_POSITIONS, 1)
         slot_qty    = math.floor(slot_budget / entry)
 
@@ -226,9 +206,9 @@ class TradeManager:
             return 0
 
         log.info(
-            "[compute_qty] %s: entry=%.2f sl_pts=%.2f "
-            "risk_qty=%d slot_qty=%d -> qty=%d (capital_used=Rs%.0f)",
-            entry, entry, sl_pts, risk_qty, slot_qty, qty, qty * entry,
+            "[compute_qty] entry=%.2f sl_pts=%.2f risk_qty=%d slot_qty=%d "
+            "-> qty=%d (capital_used=Rs%.0f)",
+            entry, sl_pts, risk_qty, slot_qty, qty, qty * entry,
         )
         return qty
 
@@ -249,11 +229,10 @@ class TradeManager:
                     prob: float, rr: Optional[float] = None,
                     side: str = "LONG", tp_mult: float = None) -> bool:
 
-        if not self.can_trade():
+        if not self.can_trade():          # includes BUG-1 session cap
             return False
 
-        # FIX-2: block symbol if daily trade cap reached
-        if not self.can_trade_symbol(symbol):
+        if not self.can_trade_symbol(symbol):   # FIX-2 per-symbol cap
             return False
 
         sector = self._get_sector(symbol)
@@ -274,8 +253,8 @@ class TradeManager:
         qty = self.compute_qty(entry, sl)
         if qty <= 0:
             log.warning(
-                "[TradeManager] %s qty=0 (entry=%.2f sl=%.2f capital=%.0f) — SKIPPED.",
-                symbol, entry, sl, self.capital,
+                "[TradeManager] %s qty=0 (entry=%.2f sl=%.2f) — SKIPPED.",
+                symbol, entry, sl,
             )
             return False
 
@@ -300,6 +279,14 @@ class TradeManager:
 
         with self._lock:
             self.positions[symbol] = pos
+
+        # BUG-1: increment session trade counter on confirmed entry
+        self._session_trade_count += 1
+        log.debug(
+            "[TradeManager] BUG-1: session_trade_count=%d/%d",
+            self._session_trade_count,
+            getattr(cfg, "MAX_TRADES_PER_DAY", 8),
+        )
 
         action = "ENTER_SHORT" if side == "SHORT" else "ENTER_LONG"
         self._log_trade(
@@ -332,10 +319,10 @@ class TradeManager:
 
         self._realised_pnl += pnl
 
-        # FIX-2: increment per-stock closed-trade counter on every exit
+        # FIX-2 (v4.5): increment per-stock closed-trade counter
         self._stock_trade_count[symbol] += 1
         log.debug(
-            "[TradeManager] FIX-2: %s trade_count today = %d/%d",
+            "[TradeManager] FIX-2: %s trade_count=%d/%d",
             symbol,
             self._stock_trade_count[symbol],
             getattr(cfg, "MAX_TRADES_PER_STOCK_PER_DAY", 3),
@@ -458,8 +445,8 @@ class TradeManager:
         self._today            = date.today()
         self._realised_pnl     = 0.0
         self._daily_cb_tripped = False
-        # FIX-2: clear per-stock trade counts for the new session
-        self._stock_trade_count.clear()
+        self._stock_trade_count.clear()   # FIX-2: per-symbol cap reset
+        self._session_trade_count = 0     # BUG-1: session cap reset
         log.info("[TradeManager] Daily state reset for %s.", self._today)
 
     def _get_sector(self, symbol: str) -> str:
@@ -479,12 +466,13 @@ class TradeManager:
             self.reset_daily()
 
     def _check_daily_cb(self) -> None:
+        """BUG-3: threshold now Rs1,500 (0.375%) via config change."""
         threshold = -(cfg.MAX_DAILY_LOSS * self.capital)
         if self._realised_pnl <= threshold:
             self._daily_cb_tripped = True
             log.warning(
-                "[TradeManager] Daily-loss CB TRIPPED: P&L=%.2f threshold=%.2f.",
-                self._realised_pnl, threshold,
+                "[TradeManager] Daily-loss CB TRIPPED: P&L=%.2f threshold=%.2f (%.1f%% of capital).",
+                self._realised_pnl, threshold, cfg.MAX_DAILY_LOSS * 100,
             )
 
     def _place_order(self, symbol: str, qty: int, price: float, side: str = "BUY") -> bool:
@@ -507,18 +495,36 @@ class TradeManager:
             log.error("[TradeManager] Order failed for %s: %s", symbol, exc)
             return False
 
-    _COLS = ["ts", "action", "symbol", "qty", "price", "sl", "tp", "rr", "prob", "pnl"]
-
     def _ensure_header(self) -> None:
-        with self._log_lock:
-            if not os.path.exists(self._log_path):
-                with open(self._log_path, "w", newline="") as f:
-                    csv.DictWriter(f, fieldnames=self._COLS).writeheader()
+        try:
+            if not os.path.exists(self._log_path) or os.path.getsize(self._log_path) == 0:
+                with self._log_lock:
+                    with open(self._log_path, "w", newline="") as f:
+                        w = csv.DictWriter(f, fieldnames=[
+                            "timestamp", "action", "symbol", "qty",
+                            "price", "sl", "tp", "rr", "prob", "pnl",
+                        ])
+                        w.writeheader()
+        except Exception as e:
+            log.warning("[TradeManager] Could not write trade log header: %s", e)
 
-    def _log_trade(self, **kwargs) -> None:
-        row = {"ts": datetime.now().isoformat(timespec="seconds")}
-        row.update(kwargs)
-        with self._log_lock:
-            with open(self._log_path, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=self._COLS, extrasaction="ignore")
-                w.writerow(row)
+    def _log_trade(self, action, symbol, qty, price, sl, tp, rr, prob, pnl) -> None:
+        row = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "action":    action,
+            "symbol":    symbol,
+            "qty":       qty,
+            "price":     round(price, 2),
+            "sl":        round(sl,    2),
+            "tp":        round(tp,    2),
+            "rr":        round(rr,    4),
+            "prob":      round(prob,  4),
+            "pnl":       round(pnl,   2),
+        }
+        try:
+            with self._log_lock:
+                with open(self._log_path, "a", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                    w.writerow(row)
+        except Exception as e:
+            log.warning("[TradeManager] Trade log write failed: %s", e)
