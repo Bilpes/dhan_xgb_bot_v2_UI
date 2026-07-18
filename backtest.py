@@ -1,5 +1,5 @@
 """
-backtest.py  —  Real-data backtest for dhan_xgb_bot_v2_UI
+backtest.py  --  Real-data backtest for dhan_xgb_bot_v2_UI
 ================================================================
 Auto-loads credentials from  config/.env  (DHAN_CLIENT_ID +
 DHAN_ACCESS_TOKEN).  Falls back to environment variables if the
@@ -17,10 +17,10 @@ Usage
 
 Output files (written to repo root)
 ------------------------------------
-  backtest_trades.csv   — every trade: symbol, entry/exit time & px,
-                          qty, SL, TP, P&L, exit reason
-  backtest_summary.csv  — day-by-day P&L, regime, win%, target hit
-  backtest_report.txt   — full text report (also printed to console)
+  backtest_trades.csv   -- every trade: symbol, entry/exit time & px,
+                           qty, SL, TP, P&L, exit reason
+  backtest_summary.csv  -- day-by-day P&L, regime, win%, target hit
+  backtest_report.txt   -- full text report (also printed to console)
 ================================================================
 """
 
@@ -40,9 +40,9 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # Load credentials from config/.env
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _ENV_FILE  = _REPO_ROOT / "config" / ".env"
@@ -51,16 +51,16 @@ try:
     from dotenv import load_dotenv
     if _ENV_FILE.exists():
         load_dotenv(_ENV_FILE)
-        print(f"[backtest] ✅  Loaded credentials from {_ENV_FILE}")
+        print(f"[backtest] OK  Loaded credentials from {_ENV_FILE}")
     else:
-        print(f"[backtest] ⚠  config/.env not found — reading shell env vars")
+        print(f"[backtest] WARN  config/.env not found -- reading shell env vars")
 except ImportError:
-    print("[backtest] ⚠  python-dotenv not installed; reading env vars directly")
+    print("[backtest] WARN  python-dotenv not installed; reading env vars directly")
 
 
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # Import existing bot config
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 try:
     from config.config import (
@@ -86,23 +86,23 @@ except ImportError:
     )
 
 
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # Load watchlist + Dhan security IDs from config/watchlist.json
 # Structure: { "tier_a": [...], "tier_b": [...], "SECURITY_IDS": {sym: id} }
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 def _load_watchlist() -> tuple[list[str], dict[str, int]]:
     """
     Returns (symbols, dhan_id_map) by reading config/watchlist.json.
 
-    Supports two layouts:
-      A) { "tier_a": [...], "tier_b": [...], "SECURITY_IDS": {sym: "id"} }  ← current repo
-      B) { "stocks": [{"symbol": ..., "security_id": ...}] }               ← legacy
-      C) flat list of strings or dicts                                       ← fallback
+    Supports three layouts:
+      A) { "tier_a": [...], "tier_b": [...], "SECURITY_IDS": {sym: "id"} }  <- current repo
+      B) { "stocks": [{"symbol": ..., "security_id": ...}] }               <- legacy
+      C) flat list of strings or dicts                                       <- fallback
     """
     candidates = [
-        _REPO_ROOT / "config" / "watchlist.json",   # primary (current repo layout)
-        _REPO_ROOT / "watchlist.json",              # legacy root location
+        _REPO_ROOT / "config" / "watchlist.json",
+        _REPO_ROOT / "watchlist.json",
     ]
 
     wl_path = None
@@ -113,30 +113,24 @@ def _load_watchlist() -> tuple[list[str], dict[str, int]]:
 
     if wl_path is None:
         raise FileNotFoundError(
-            f"watchlist.json not found. Looked in:\n"
+            "watchlist.json not found. Looked in:\n"
             + "\n".join(f"  {p}" for p in candidates)
         )
 
-    with open(wl_path) as f:
+    with open(wl_path, encoding="utf-8") as f:
         wl = json.load(f)
 
-    symbols: list[str]    = []
+    symbols: list[str]       = []
     dhan_ids: dict[str, int] = {}
 
-    # ── Layout A: tier_a / tier_b (current repo) ──────────────────────
     if "tier_a" in wl or "tier_b" in wl:
-        symbols = (
-            list(wl.get("tier_a", []))
-            + list(wl.get("tier_b", []))
-        )
-        # SECURITY_IDS values are strings in the JSON — cast to int
+        symbols = list(wl.get("tier_a", [])) + list(wl.get("tier_b", []))
         for sym, sid in wl.get("SECURITY_IDS", {}).items():
             try:
                 dhan_ids[sym] = int(sid)
             except (ValueError, TypeError):
                 pass
 
-    # ── Layout B: stocks list of dicts ──────────────────────────────
     elif "stocks" in wl:
         for entry in wl["stocks"]:
             sym = entry.get("symbol", "")
@@ -146,7 +140,6 @@ def _load_watchlist() -> tuple[list[str], dict[str, int]]:
                 if sid:
                     dhan_ids[sym] = int(sid)
 
-    # ── Layout C: flat list ────────────────────────────────────────────
     elif isinstance(wl, list):
         for entry in wl:
             if isinstance(entry, str):
@@ -159,24 +152,19 @@ def _load_watchlist() -> tuple[list[str], dict[str, int]]:
                     if sid:
                         dhan_ids[sym] = int(sid)
 
-    symbols = [s for s in symbols if s]  # strip blanks
-    print(f"[backtest] ✅  Watchlist loaded: {len(symbols)} symbols from {wl_path.name}")
+    symbols = [s for s in symbols if s]
+    print(f"[backtest] OK  Watchlist loaded: {len(symbols)} symbols from {wl_path.name}")
     return symbols, dhan_ids
 
 
 SYMBOLS, _WL_DHAN_IDS = _load_watchlist()
 
 # Nifty 50 index constants
-NIFTY_YF   = "^NSEI"      # yfinance ticker
-NIFTY_DHAN = "__NIFTY__"  # internal key
+NIFTY_YF   = "^NSEI"
+NIFTY_DHAN = "__NIFTY__"
 NIFTY_SEC_ID = int(os.environ.get("NIFTY50_SECURITY_ID", "13"))
 
-# Dhan security ID map:
-#   1. Populated from watchlist.json SECURITY_IDS (single source of truth)
-#   2. Hard-coded fallback for stocks not in watchlist
-#   3. Nifty index appended at end
 DHAN_ID: dict[str, int] = {
-    # Fallback for stocks that may not be in the watchlist file
     "HDFCBANK":   1333,  "ICICIBANK":  4963,  "SBIN":       3045,
     "AXISBANK":   5900,  "KOTAKBANK":  1922,  "BAJFINANCE": 317,
     "RELIANCE":   2885,  "EICHERMOT":  910,   "SUNPHARMA":  3351,
@@ -185,18 +173,40 @@ DHAN_ID: dict[str, int] = {
     "TRENT":      1964,  "ETERNAL":    5097,  "ADANIPORTS": 15083,
     "CHOLAFIN":   685,   "CGPOWER":    760,   "HAVELLS":    9819,
 }
-# Override with watchlist.json values (these are authoritative)
 DHAN_ID.update(_WL_DHAN_IDS)
-# Nifty index entry
 DHAN_ID[NIFTY_DHAN] = NIFTY_SEC_ID
 
-# Dhan API: max 90 calendar days per intraday request
 _DHAN_MAX_CHUNK_DAYS = 85
 
+# Dhan SDK interval map: CLI minutes string -> SDK interval constant
+_DHAN_INTERVAL_MAP = {
+    "1":  "1",
+    "5":  "5",
+    "15": "15",
+    "25": "25",
+    "60": "60",
+}
 
-# ═════════════════════════════════════════════════════════════════════
-# DATA LAYER — Dhan historical API
-# ═════════════════════════════════════════════════════════════════════
+
+# -------------------------------------------------------------------
+# DATA LAYER -- Dhan historical API  (dhanhq v2 SDK)
+#
+# The v2 SDK method is:  dhan.get_intraday_candle_data(...)
+# NOT historical_minute_charts() which was v1.
+#
+# v2 signature:
+#   get_intraday_candle_data(
+#       security_id   : str,
+#       exchange_segment : str,   # "NSE_EQ" or "IDX_I"
+#       instrument_type  : str,   # "EQUITY" or "INDEX"
+#       interval         : str,   # "1", "5", "15", "25", "60"
+#       from_date        : str,   # "YYYY-MM-DD"
+#       to_date          : str,
+#   )
+# Response: { "data": { "open": [...], "high": [...], "low": [...],
+#                       "close": [...], "volume": [...],
+#                       "timestamp": [...] } }
+# -------------------------------------------------------------------
 
 def _dhan_fetch_one(
     dhan,
@@ -206,11 +216,6 @@ def _dhan_fetch_one(
     to_date: date,
     interval: str,
 ) -> pd.DataFrame:
-    """
-    Fetch one symbol from Dhan API, auto-chunking ranges that exceed
-    _DHAN_MAX_CHUNK_DAYS (Dhan rejects intraday requests > 90 days).
-    Returns a single concatenated OHLCV DataFrame indexed by IST timestamp.
-    """
     is_index = sym == NIFTY_DHAN
     frames: list[pd.DataFrame] = []
 
@@ -218,23 +223,31 @@ def _dhan_fetch_one(
     while chunk_start <= to_date:
         chunk_end = min(chunk_start + timedelta(days=_DHAN_MAX_CHUNK_DAYS - 1), to_date)
         try:
-            resp = dhan.historical_minute_charts(
-                symbol           = "NIFTY" if is_index else sym,
-                exchange_segment = "IDX_I" if is_index else "NSE_EQ",
-                instrument_type  = "INDEX" if is_index else "EQUITY",
-                expiry_code      = 0,
+            resp = dhan.get_intraday_candle_data(
+                security_id      = str(sec_id),
+                exchange_segment = "IDX_I"  if is_index else "NSE_EQ",
+                instrument_type  = "INDEX"  if is_index else "EQUITY",
+                interval         = _DHAN_INTERVAL_MAP.get(interval, "5"),
                 from_date        = str(chunk_start),
                 to_date          = str(chunk_end),
             )
-            data = resp.get("data", {})
+
+            # handle both dict-response and direct-list-response
+            if isinstance(resp, dict):
+                data = resp.get("data", resp)
+            else:
+                data = resp
+
             if data:
+                # normalise key names (SDK uses 'timestamp' or 'start_Time')
+                ts_key = "timestamp" if "timestamp" in data else "start_Time"
                 df = pd.DataFrame({
-                    "open":      data.get("open",       []),
-                    "high":      data.get("high",       []),
-                    "low":       data.get("low",        []),
-                    "close":     data.get("close",      []),
-                    "volume":    data.get("volume",     []),
-                    "timestamp": data.get("start_Time", []),
+                    "open":      data.get("open",    []),
+                    "high":      data.get("high",    []),
+                    "low":       data.get("low",     []),
+                    "close":     data.get("close",   []),
+                    "volume":    data.get("volume",  []),
+                    "timestamp": data.get(ts_key,    []),
                 })
                 if not df.empty:
                     df.index = (
@@ -244,7 +257,7 @@ def _dhan_fetch_one(
                     df = df[["open", "high", "low", "close", "volume"]].dropna()
                     frames.append(df)
         except Exception as exc:
-            print(f"    ⚠  chunk {chunk_start}→{chunk_end}: {exc}")
+            print(f"    WARN  chunk {chunk_start} to {chunk_end}: {exc}")
 
         chunk_start = chunk_end + timedelta(days=1)
 
@@ -262,7 +275,7 @@ def fetch_dhan(
 ) -> dict[str, pd.DataFrame]:
     """
     Fetch OHLCV for all symbols + Nifty from Dhan historical API.
-    Credentials are read from env (auto-loaded from config/.env).
+    Uses dhanhq v2 SDK: get_intraday_candle_data()
     interval: "1" | "5" | "15" | "25" | "60" minutes
     """
     from dhanhq import dhanhq
@@ -280,28 +293,27 @@ def fetch_dhan(
     all_syms = symbols + [NIFTY_DHAN]
     total    = len(all_syms)
 
-    print(f"\n[Dhan API] Fetching {total} symbols  {start} → {end}  interval={interval}m")
-    print(f"           Range: {(end - start).days} days  "
-          f"(≤{_DHAN_MAX_CHUNK_DAYS}-day chunks)\n")
+    print(f"\n[Dhan API] Fetching {total} symbols  {start} to {end}  interval={interval}m")
+    print(f"           Range: {(end - start).days} days  (<={_DHAN_MAX_CHUNK_DAYS}-day chunks)\n")
 
     for i, sym in enumerate(all_syms, 1):
         sec_id = DHAN_ID.get(sym)
         if not sec_id:
-            print(f"  [{i:>3}/{total}]  ⚠  {sym}: not in DHAN_ID map — skipping")
+            print(f"  [{i:>3}/{total}]  SKIP  {sym}: not in DHAN_ID map")
             continue
         df = _dhan_fetch_one(dhan, sym, sec_id, start, end, interval)
         if df.empty:
-            print(f"  [{i:>3}/{total}]  ✗  {sym}: no data returned")
+            print(f"  [{i:>3}/{total}]  FAIL  {sym}: no data returned")
         else:
             result[sym] = df
-            print(f"  [{i:>3}/{total}]  ✓  {sym}: {len(df):>5} candles")
+            print(f"  [{i:>3}/{total}]  OK    {sym}: {len(df):>5} candles")
 
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════
-# DATA LAYER — yfinance (fallback, no credentials needed)
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
+# DATA LAYER -- yfinance (fallback, no credentials needed)
+# -------------------------------------------------------------------
 
 def fetch_yfinance(
     symbols: list[str],
@@ -319,7 +331,7 @@ def fetch_yfinance(
     tickers_ns = {sym: (sym if sym.startswith("^") else f"{sym}.NS") for sym in all_syms}
     result: dict[str, pd.DataFrame] = {}
 
-    print(f"\n[yfinance] Fetching {len(all_syms)} tickers  {start} → {end}  interval={interval}")
+    print(f"\n[yfinance] Fetching {len(all_syms)} tickers  {start} to {end}  interval={interval}")
 
     raw = yf.download(
         tickers     = list(tickers_ns.values()),
@@ -333,31 +345,61 @@ def fetch_yfinance(
 
     for sym, ticker in tickers_ns.items():
         try:
-            df = raw[ticker].copy() if len(tickers_ns) > 1 else raw.copy()
+            if len(tickers_ns) > 1:
+                if ticker not in raw.columns.get_level_values(0):
+                    continue
+                df = raw[ticker].copy()
+            else:
+                df = raw.copy()
+
             if df is None or df.empty:
                 continue
+
+            # flatten MultiIndex columns if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
-            df.index   = pd.to_datetime(df.index)
-            df.index   = df.index.tz_localize("Asia/Kolkata") if df.index.tz is None \
-                         else df.index.tz_convert("Asia/Kolkata")
+
+            # ensure tz-aware IST index
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("Asia/Kolkata")
+            else:
+                df.index = df.index.tz_convert("Asia/Kolkata")
+
             df = df[["open", "high", "low", "close", "volume"]].dropna()
+
+            # keep only market hours 09:15 - 15:30 IST
+            df = df.between_time("09:15", "15:30")
+
+            if df.empty:
+                continue
+
             result[sym] = df
-            print(f"  ✓  {sym}: {len(df)} candles")
+            print(f"  OK    {sym}: {len(df)} candles")
         except Exception as exc:
-            print(f"  ✗  {sym}: {exc}")
+            print(f"  FAIL  {sym}: {exc}")
 
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # HELPERS
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 def _day_slice(df: pd.DataFrame, d: date) -> pd.DataFrame:
+    """
+    Extract candles for a single calendar date from a tz-aware DataFrame.
+    Uses .date() comparison instead of .normalize() to avoid tz issues.
+    """
     if df.empty:
         return df
-    mask = df.index.normalize() == pd.Timestamp(d, tz="Asia/Kolkata")
-    return df.loc[mask].between_time("09:15", "15:30")
+    # df.index.date returns an array of datetime.date objects -- safe for tz-aware
+    mask = np.array(df.index.date) == d
+    sliced = df.loc[mask]
+    if sliced.empty:
+        return sliced
+    return sliced.between_time("09:15", "15:30")
 
 
 def _get_regime(nifty_day: pd.DataFrame) -> tuple[str, float]:
@@ -436,9 +478,9 @@ def _trade_rec(
     }
 
 
-# ═════════════════════════════════════════════════════════════════════
-# CORE — bar-by-bar replay for ONE trading day
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
+# CORE -- bar-by-bar replay for ONE trading day
+# -------------------------------------------------------------------
 
 def replay_day(
     trade_date: date,
@@ -492,7 +534,7 @@ def replay_day(
         if dtime(12, 30) <= t < dtime(13, 0):
             continue
 
-        # SL / TP check
+        # SL / TP check on open positions
         for sym in list(open_pos.keys()):
             pos = open_pos[sym]
             df  = _day_slice(all_data.get(sym, pd.DataFrame()), trade_date)
@@ -514,7 +556,7 @@ def replay_day(
                 day_trades.append(_trade_rec(trade_date, sym, pos, ep, ts, pnl, reason, regime))
                 del open_pos[sym]
 
-        # Profit-lock
+        # Profit-lock check
         if daily_pnl >= DAILY_TARGET:
             post_target = True
         if post_target and daily_pnl < peak_pnl - PROFIT_PULLBACK_RS:
@@ -546,16 +588,16 @@ def replay_day(
                 sideways_day = True
 
         # Entry guards
-        if sideways_day:                                           continue
-        if NIFTY_WEAK_HARD_STOP and regime == "WEAK":             continue
-        if post_target and POST_TARGET_BULL_ONLY and not is_bull:  continue
-        if len(open_pos) >= MAX_OPEN_POSITIONS:                    continue
+        if sideways_day:                                            continue
+        if NIFTY_WEAK_HARD_STOP and regime == "WEAK":              continue
+        if post_target and POST_TARGET_BULL_ONLY and not is_bull:   continue
+        if len(open_pos) >= MAX_OPEN_POSITIONS:                     continue
 
         # Entry scan
         for sym in SYMBOLS:
-            if sym in open_pos:                                        continue
-            if stock_trades[sym] >= MAX_TRADES_PER_STOCK_PER_DAY:     continue
-            if len(open_pos) >= MAX_OPEN_POSITIONS:                    break
+            if sym in open_pos:                                         continue
+            if stock_trades[sym] >= MAX_TRADES_PER_STOCK_PER_DAY:      continue
+            if len(open_pos) >= MAX_OPEN_POSITIONS:                     break
 
             df  = _day_slice(all_data.get(sym, pd.DataFrame()), trade_date)
             row = df[df.index == ts]
@@ -621,15 +663,15 @@ def replay_day(
     }
 
 
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # MAIN ORCHESTRATOR
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 def run_backtest(
     source:   str        = "dhan",
     days:     int        = 60,
-    start:    date|None  = None,
-    end:      date|None  = None,
+    start:    date | None = None,
+    end:      date | None = None,
     interval: str        = "5",
 ) -> None:
     if end is None:
@@ -638,10 +680,10 @@ def run_backtest(
         start = end - timedelta(days=days)
 
     print(f"\n{'='*64}")
-    print(f"  BACKTEST  |  source={source.upper()}  |  {start} → {end}")
-    print(f"  Symbols   : {len(SYMBOLS)}  |  Capital: ₹{CAPITAL:,.0f}")
-    print(f"  Target/day: ₹{DAILY_TARGET:,.0f}  |  Max daily loss: {MAX_DAILY_LOSS*100:.1f}%")
-    print(f"  Profit-lock pullback: ₹{PROFIT_PULLBACK_RS}  |  Interval: {interval}m")
+    print(f"  BACKTEST  |  source={source.upper()}  |  {start} to {end}")
+    print(f"  Symbols   : {len(SYMBOLS)}  |  Capital: Rs.{CAPITAL:,.0f}")
+    print(f"  Target/day: Rs.{DAILY_TARGET:,.0f}  |  Max daily loss: {MAX_DAILY_LOSS*100:.1f}%")
+    print(f"  Profit-lock pullback: Rs.{PROFIT_PULLBACK_RS}  |  Interval: {interval}m")
     print(f"{'='*64}\n")
 
     if source == "dhan":
@@ -675,13 +717,13 @@ def run_backtest(
         all_trades.extend(trades)
         all_summaries.append(summary)
 
-        icon  = "🟢" if summary["day_pnl"] >= 0 else "🔴"
+        icon  = "[+]" if summary["day_pnl"] >= 0 else "[-]"
         flags = (
-            " [TARGET]✓" if summary["target_hit"]    else ""
+            " [TARGET]" if summary["target_hit"]    else ""
         ) + (
-            " [LOCKED]"  if summary["profit_locked"] else ""
+            " [LOCKED]" if summary["profit_locked"] else ""
         ) + (
-            " [CB]⚠"    if summary["cb_triggered"]  else ""
+            " [CB]"     if summary["cb_triggered"]  else ""
         )
         print(
             f"  {d}  {summary['regime']:<8}"
@@ -712,47 +754,39 @@ def run_backtest(
     top5    = sorted(sym_pnl.items(), key=lambda x: -x[1])[:5]
     bottom5 = sorted(sym_pnl.items(), key=lambda x:  x[1])[:5]
 
-    sep    = "─" * 64
-    report = f"""
-{'='*64}
-BACKTEST REPORT  |  {start} → {end}  ({len(trading_dates)} trading days)
-{'='*64}
-Data Source        : {source.upper()}
-Candle Interval    : {interval}m
-Capital            : ₹{CAPITAL:>14,.0f}
-Daily Target       : ₹{DAILY_TARGET:>14,.0f}
-Profit-lock        : ₹{PROFIT_PULLBACK_RS} pullback after target
-
-{sep}
-P & L SUMMARY
-{sep}
-Total Net P&L      : ₹{total_pnl:>+14,.2f}
-Profitable Days    : {profit_days:>4} / {len(trading_dates)}
-Target-hit Days    : {target_days:>4} / {len(trading_dates)}
-Best Day           : ₹{max(s['day_pnl'] for s in all_summaries):>+14,.2f}
-Worst Day          : ₹{min(s['day_pnl'] for s in all_summaries):>+14,.2f}
-
-{sep}
-TRADE STATISTICS
-{sep}
-Total Trades       : {total_trades:>6}
-Win Rate           : {win_rate:>5.1f}%  ({total_wins}W / {total_losses}L)
-Avg Winning Trade  : ₹{avg_win:>+12,.2f}
-Avg Losing Trade   : ₹{avg_loss:>+12,.2f}
-Gross Profit       : ₹{gross_profit:>12,.2f}
-Gross Loss         : ₹{gross_loss:>12,.2f}
-Profit Factor      : {pf:>10.2f}
-
-{sep}
-TOP 5 STOCKS
-{sep}
-  {'Symbol':<14}  {'Net P&L':>12}"""
+    sep    = "-" * 64
+    report = (
+        f"\n{'='*64}\n"
+        f"BACKTEST REPORT  |  {start} to {end}  ({len(trading_dates)} trading days)\n"
+        f"{'='*64}\n"
+        f"Data Source        : {source.upper()}\n"
+        f"Candle Interval    : {interval}m\n"
+        f"Capital            : Rs.{CAPITAL:>14,.0f}\n"
+        f"Daily Target       : Rs.{DAILY_TARGET:>14,.0f}\n"
+        f"Profit-lock        : Rs.{PROFIT_PULLBACK_RS} pullback after target\n"
+        f"\n{sep}\nP & L SUMMARY\n{sep}\n"
+        f"Total Net P&L      : Rs.{total_pnl:>+14,.2f}\n"
+        f"Profitable Days    : {profit_days:>4} / {len(trading_dates)}\n"
+        f"Target-hit Days    : {target_days:>4} / {len(trading_dates)}\n"
+        f"Best Day           : Rs.{max(s['day_pnl'] for s in all_summaries):>+14,.2f}\n"
+        f"Worst Day          : Rs.{min(s['day_pnl'] for s in all_summaries):>+14,.2f}\n"
+        f"\n{sep}\nTRADE STATISTICS\n{sep}\n"
+        f"Total Trades       : {total_trades:>6}\n"
+        f"Win Rate           : {win_rate:>5.1f}%  ({total_wins}W / {total_losses}L)\n"
+        f"Avg Winning Trade  : Rs.{avg_win:>+12,.2f}\n"
+        f"Avg Losing Trade   : Rs.{avg_loss:>+12,.2f}\n"
+        f"Gross Profit       : Rs.{gross_profit:>12,.2f}\n"
+        f"Gross Loss         : Rs.{gross_loss:>12,.2f}\n"
+        f"Profit Factor      : {pf:>10.2f}\n"
+        f"\n{sep}\nTOP 5 STOCKS\n{sep}\n"
+        f"  {'Symbol':<14}  {'Net P&L':>12}\n"
+    )
     for sym, pnl in top5:
-        report += f"\n  {sym:<14}  ₹{pnl:>+10,.2f}"
-    report += f"\n\n{sep}\nBOTTOM 5 STOCKS\n{sep}\n  {'Symbol':<14}  {'Net P&L':>12}"
+        report += f"  {sym:<14}  Rs.{pnl:>+10,.2f}\n"
+    report += f"\n{sep}\nBOTTOM 5 STOCKS\n{sep}\n  {'Symbol':<14}  {'Net P&L':>12}\n"
     for sym, pnl in bottom5:
-        report += f"\n  {sym:<14}  ₹{pnl:>+10,.2f}"
-    report += f"\n{'='*64}\n"
+        report += f"  {sym:<14}  Rs.{pnl:>+10,.2f}\n"
+    report += f"{'='*64}\n"
 
     print(report)
 
@@ -761,25 +795,26 @@ TOP 5 STOCKS
     if not trades_df.empty:
         p = out / "backtest_trades.csv"
         trades_df.to_csv(p, index=False)
-        print(f"  ✓ {p}")
+        print(f"  OK {p}")
 
     summary_df = pd.DataFrame(all_summaries)
     p = out / "backtest_summary.csv"
     summary_df.to_csv(p, index=False)
-    print(f"  ✓ {p}")
+    print(f"  OK {p}")
 
+    # FIX: always write as UTF-8 to avoid cp1252 crash on Windows
     p = out / "backtest_report.txt"
-    p.write_text(report)
-    print(f"  ✓ {p}\n")
+    p.write_text(report, encoding="utf-8")
+    print(f"  OK {p}\n")
 
 
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # CLI
-# ═════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Real-data 60-day backtest — dhan_xgb_bot_v2_UI"
+        description="Real-data backtest -- dhan_xgb_bot_v2_UI"
     )
     ap.add_argument("--source",   choices=["dhan", "yfinance"], default="dhan")
     ap.add_argument("--days",     type=int, default=60)
