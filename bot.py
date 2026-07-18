@@ -1,6 +1,17 @@
 # bot.py — dhan_xgb_bot_v2
 # =============================================================
-# v4.4 PATCH 2026-07-18:
+# v4.5 PATCH 2026-07-19:
+#
+#   BUG-2 WIRE: NEUTRAL SL STREAK TRACKING
+#     import increment_neutral_sl_streak / reset_neutral_sl_streak
+#     from signal_engine (added in backtest-fix PR).
+#     _manage_positions() now calls:
+#       increment_neutral_sl_streak() → after any SL exit on NEUTRAL day
+#       reset_neutral_sl_streak()     → after any TP / profit exit
+#     run() calls reset_neutral_sl_streak() at session start alongside
+#     tm.reset_daily() so the counter is always clean on day-open.
+#
+#   v4.4 PATCH 2026-07-18:
 #
 #   GAP-1: SIDEWAYS DAY DETECTION
 #     New counter: _neutral_scan_count
@@ -32,7 +43,12 @@ from datetime import datetime, time as dtime
 import config as cfg
 
 from watchlist import get_watchlist, BLOCKED_SYMBOLS
-from signal_engine import SignalEngine, get_nifty_regime
+from signal_engine import (
+    SignalEngine,
+    get_nifty_regime,
+    increment_neutral_sl_streak,   # BUG-2 wire
+    reset_neutral_sl_streak,       # BUG-2 wire
+)
 from trade_manager import TradeManager
 from watchlist_manager import WatchlistManager
 
@@ -83,7 +99,7 @@ class DhanXGBBot:
             feature_cols = self.engine.features,
         )
         self.tm.set_watchlist_manager(self.wm)
-        log.info("DhanXGBBot v4.4 — slot-budget sizing + sideways-skip + adaptive TP")
+        log.info("DhanXGBBot v4.5 — bug2 NEUTRAL SL streak wired + sideways-skip + adaptive TP")
 
     def _connect(self):
         if cfg.PAPER_TRADE:
@@ -426,6 +442,20 @@ class DhanXGBBot:
                 self.notify(
                     f"EXIT {sym} [{reason}] | PnL=Rs{self.tm.daily_pnl:.2f}"
                 )
+                # BUG-2 WIRE: update NEUTRAL SL streak on every exit
+                if self.regime == "NEUTRAL":
+                    if reason == "SL":
+                        increment_neutral_sl_streak()
+                        log.info(
+                            "[NeutralStreak] SL exit on NEUTRAL — streak incremented "
+                            "(sym=%s)", sym
+                        )
+                    elif reason in ("TP", "TRAIL", "PROFIT_LOCK"):
+                        reset_neutral_sl_streak()
+                        log.info(
+                            "[NeutralStreak] Profit exit on NEUTRAL — streak reset "
+                            "(sym=%s reason=%s)", sym, reason
+                        )
 
     # ----------------------------------------------------------------
     def reload(self):
@@ -434,7 +464,10 @@ class DhanXGBBot:
         log.info("Model reloaded")
 
     def run(self):
+        # Reset all daily state including NEUTRAL SL streak (BUG-2)
         self.tm.reset_daily()
+        reset_neutral_sl_streak()
+        log.info("[NeutralStreak] Reset at session open.")
 
         for h in range(9, 16):
             for m in range(0, 60, 5):
@@ -447,7 +480,7 @@ class DhanXGBBot:
         self.wm.run_scheduled()
 
         self.notify(
-            f"DhanXGBBot v4.4 started | PAPER={cfg.PAPER_TRADE} | "
+            f"DhanXGBBot v4.5 started | PAPER={cfg.PAPER_TRADE} | "
             f"Capital=Rs{cfg.CAPITAL:,.0f} | Slots={cfg.MAX_OPEN_POSITIONS} | "
             f"SlotBudget=Rs{cfg.CAPITAL//cfg.MAX_OPEN_POSITIONS:,.0f} | "
             f"TP=1.8x(chop)/2.5x(bull) | Target=Rs{getattr(cfg,'DAILY_TARGET',500):.0f}"
