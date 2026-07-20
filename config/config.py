@@ -2,6 +2,34 @@
 #  config/config.py  — Infrastructure, paths, API keys,
 #                        timing, filters, Redis, Telegram.
 #
+#  v4.7 PATCH 2026-07-20  (backtest tuning — 4 new knobs):
+#
+#  KNOB-1: NEUTRAL_TRADE_CAP = 4
+#    Previously MAX_TRADES_NEUTRAL_DAY was hardcoded to 8 in
+#    backtest.py.  Moved here so live bot + backtest share the
+#    same value.  Halving entries on NEUTRAL days cuts noise
+#    trades on flat sessions (real backtest: high-trade NEUTRAL
+#    days avg 32% win vs 47% for low-trade NEUTRAL days).
+#
+#  KNOB-2: SIGNAL_SCORE_MIN = 10
+#    Minimum XGBoost probability threshold expressed as a 0-20
+#    integer score (score = int(prob * 20)).  Raising from 8
+#    (prob ≥ 0.40) to 10 (prob ≥ 0.50) filters out marginal
+#    entries.  Used by signal_engine.py and backtest.py.
+#
+#  KNOB-3: STOCK_LOSS_CAP = 600
+#    Per-stock per-day loss cap tightened from Rs.800 → Rs.600.
+#    Exits a symbol sooner before it can bleed further.
+#    Replaces the hardcoded MAX_STOCK_LOSS_PER_DAY = -800 in
+#    backtest.py.
+#
+#  KNOB-4: NEUTRAL_DAY_SKIP_LIST
+#    High-beta stocks that caused 87% of losses on NEUTRAL days:
+#    SBIN (-₹2,618), LT (-₹2,363), RELIANCE (-₹2,062),
+#    AXISBANK (-₹1,827).  On NEUTRAL regime days the bot skips
+#    new entries for these symbols entirely.  On BULL days they
+#    trade normally.
+#
 #  v4.6 PATCH 2026-07-19  (4 backtest bug fixes from real data):
 #
 #  BUG-1: MAX_TRADES_PER_DAY = 8
@@ -25,13 +53,8 @@
 #    high-beta names need score ≥10 (prob ≥ 0.64) on NEUTRAL days
 #    to avoid chasing momentum against the broader market trend.
 #
-#  v4.5 PATCH 2026-07-18  (retained — 3 synthetic backtest fixes):
-#  FIX-1 [GAP-1]: SIDEWAYS_CONSECUTIVE_SCANS 3→2
-#  FIX-2: MAX_TRADES_PER_STOCK_PER_DAY = 3
-#  FIX-3: MIN_SIGNAL_SCORE_WEAK = 10
-#
-#  v4.4 PATCH 2026-07-18 (retained):
-#  SIZING REWORK — slot budget Rs1L per trade, no cap.
+#  v4.5 PATCH 2026-07-18  (retained — 3 synthetic backtest fixes)
+#  v4.4 PATCH 2026-07-18  (retained)
 # ============================================================
 
 import os
@@ -146,6 +169,41 @@ BANKING_STOCKS = [
     "LT", "RELIANCE",          # over-traded high-beta non-banks included
 ]
 BUY_THRESHOLD_BANKING_NEUTRAL = 0.64   # BUG-4: NEW — prob ≥ 0.64 on NEUTRAL
+
+
+# ── KNOB-1 (v4.7): NEUTRAL day entry cap ────────────────────────────
+# Max total new entries allowed on a NEUTRAL regime day.
+# Replaces the hardcoded MAX_TRADES_NEUTRAL_DAY = 8 in backtest.py.
+# Set to 4 (half of 8) — real backtest showed low-trade NEUTRAL days
+# (≤6 trades) had 47% win rate vs 32% for high-trade NEUTRAL days (>10).
+NEUTRAL_TRADE_CAP            = 4    # KNOB-1: was hardcoded 8 in backtest.py
+
+
+# ── KNOB-2 (v4.7): Minimum signal score ─────────────────────────────
+# XGBoost probability expressed as integer score (score = int(prob * 20)).
+# NEUTRAL/WEAK day entries must meet this threshold.
+# 10 → prob ≥ 0.50  (previously 8 → prob ≥ 0.40)
+# Higher value = fewer but higher-quality entries on flat days.
+SIGNAL_SCORE_MIN             = 10   # KNOB-2: was 8 (implicit)
+
+
+# ── KNOB-3 (v4.7): Per-stock daily loss cap ─────────────────────────
+# How much a single stock can lose in one day before new entries are
+# blocked for that symbol for the rest of the session.
+# Tightened from Rs.800 → Rs.600 to exit sooner on losers.
+# Replaces hardcoded MAX_STOCK_LOSS_PER_DAY = -800 in backtest.py.
+STOCK_LOSS_CAP               = 600  # KNOB-3: was 800
+
+
+# ── KNOB-4 (v4.7): Skip list on NEUTRAL days ────────────────────────
+# Symbols that are completely skipped on NEUTRAL regime days.
+# These high-beta stocks caused 87% of all losses in the 30-day
+# real backtest:
+#   SBIN     -₹2,618  |  LT       -₹2,363
+#   RELIANCE -₹2,062  |  AXISBANK -₹1,827
+# On BULL days they trade normally (no restriction).
+# Empty list = no skip (disable this guard).
+NEUTRAL_DAY_SKIP_LIST        = ["SBIN", "LT", "RELIANCE", "AXISBANK"]  # KNOB-4
 
 
 # ── Trade mode ────────────────────────────────────────────────────────
